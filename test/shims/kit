@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# kit shim: records argv and exits without starting a session.
+set -u
+printf 'kit %s\n' "$*" >>"${SHIM_LOG:?SHIM_LOG is not set}"
+exit 0

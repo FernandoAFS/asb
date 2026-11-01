@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# bwrap shim: records argv and exits without sandboxing.
+set -u
+printf 'bwrap %s\n' "$*" >>"${SHIM_LOG:?SHIM_LOG is not set}"
+exit 0

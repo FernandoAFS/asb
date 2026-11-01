@@ -1,0 +1,543 @@
+#!/usr/bin/env bash
+#
+# kwt — kit worktree wrapper
+#
+# Creates or reuses a git Worktree for a branch, links the shared dependency
+# and env paths into it, opens a tmux window for it, and launches kit inside a
+# default-deny bwrap sandbox. See .scratch/kwt/spec.md for the specification.
+#
+set -euo pipefail
+
+PROG=kwt
+
+# ---------------------------------------------------------------------------
+# State populated by resolution and command parsing.
+# ---------------------------------------------------------------------------
+MAIN=""
+COMMON_DIR=""
+PROJECT=""
+BRANCH=""
+SLUG=""
+WT_PATH=""
+BASE=""
+WINDOW=""
+DETACHED=0
+DRY_RUN=0
+ALLOW_GIT_WRITE=0
+PROMPT=()
+LINK_NAMES=()
+LINK_TARGETS=()
+SHARED_TARGETS=()
+SANDBOX_ARGV=()
+
+die() { printf '%s: error: %s\n' "$PROG" "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+usage:
+  kwt <branch> [--base <branch>] [-d|--detached] [--allow-git-write] [--dry-run] [-- <prompt>...]
+  kwt shell <branch> [--create] [--sandboxed] [--dry-run]
+  kwt ls
+  kwt rm [<branch>] [--force]
+
+options:
+  -b, --base <branch>   base for a new branch (default: current HEAD)
+  -d, --detached        create the Worktree and window without switching
+      --allow-git-write make git state writable inside the sandbox
+      --dry-run         print the plan and perform no side effects
+  -h, --help            show this help
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Resolution
+# ---------------------------------------------------------------------------
+# Resolve the Project from anywhere in a git repository, including from inside
+# a Worktree. The git common dir is `<main>/.git`, so its parent is the Main
+# checkout regardless of where the command was invoked.
+resolve_project() {
+  local common
+  if ! common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null); then
+    die "not inside a git repository"
+  fi
+  COMMON_DIR=$(cd "$common" && pwd -P)
+  MAIN=$(dirname "$COMMON_DIR")
+  PROJECT=$(basename "$MAIN")
+}
+
+slug_of() { printf '%s' "${1//\//-}"; }
+
+# The single Worktree path for a Slug.
+worktree_path() { printf '%s/.worktrees/%s' "$MAIN" "$1"; }
+
+main_is_python() {
+  local f
+  for f in pyproject.toml requirements.txt uv.lock poetry.lock setup.py; do
+    if [ -e "$MAIN/$f" ]; then return 0; fi
+  done
+  return 1
+}
+
+main_is_node() {
+  [ -e "$MAIN/package.json" ]
+}
+
+worktree_exists() {
+  [ -e "$WT_PATH/.git" ]
+}
+
+branch_exists() {
+  git -C "$MAIN" show-ref --verify --quiet "refs/heads/$BRANCH"
+}
+
+# ---------------------------------------------------------------------------
+# Links
+# ---------------------------------------------------------------------------
+# Emit `<name>\t<abs target>` for each shared path the Main checkout provides:
+# .venv when it looks Python, node_modules when it looks Node, .env always.
+candidate_targets() {
+  if main_is_python && [ -e "$MAIN/.venv" ]; then printf '.venv\t%s\n' "$MAIN/.venv"; fi
+  if main_is_node && [ -e "$MAIN/node_modules" ]; then printf 'node_modules\t%s\n' "$MAIN/node_modules"; fi
+  if [ -e "$MAIN/.env" ]; then printf '.env\t%s\n' "$MAIN/.env"; fi
+}
+
+# Links to create for a freshly created Worktree. A reused Worktree is never
+# changed, so nothing is listed for it.
+compute_links() {
+  LINK_NAMES=()
+  LINK_TARGETS=()
+  if worktree_exists; then return 0; fi
+  local name target
+  while IFS=$'\t' read -r name target; do
+    if [ ! -e "$WT_PATH/$name" ] && [ ! -L "$WT_PATH/$name" ]; then
+      LINK_NAMES+=("$name")
+      LINK_TARGETS+=("$target")
+    fi
+  done < <(candidate_targets)
+}
+
+create_links() {
+  local i name target
+  for i in "${!LINK_NAMES[@]}"; do
+    name=${LINK_NAMES[$i]}
+    target=${LINK_TARGETS[$i]}
+    if [ ! -e "$WT_PATH/$name" ] && [ ! -L "$WT_PATH/$name" ]; then
+      ln -s "$target" "$WT_PATH/$name"
+    fi
+  done
+}
+
+# Every shared path that must be bound read-only inside the sandbox: the
+# existing symlinks of a reused Worktree, plus the links a fresh Worktree will
+# receive.
+compute_shared_targets() {
+  SHARED_TARGETS=()
+  local name target
+  while IFS=$'\t' read -r name target; do
+    if [ -L "$WT_PATH/$name" ]; then
+      SHARED_TARGETS+=("$(readlink -f "$WT_PATH/$name")")
+    elif [ ! -e "$WT_PATH/$name" ]; then
+      SHARED_TARGETS+=("$target")
+    fi
+  done < <(candidate_targets)
+}
+
+# ---------------------------------------------------------------------------
+# Worktree creation
+# ---------------------------------------------------------------------------
+ensure_exclude() {
+  local exclude="$COMMON_DIR/info/exclude"
+  if [ ! -e "$exclude" ]; then
+    mkdir -p "$(dirname "$exclude")"
+    : >"$exclude"
+  fi
+  if ! grep -qxF '.worktrees' "$exclude"; then
+    printf '.worktrees\n' >>"$exclude"
+  fi
+}
+
+ensure_worktree() {
+  if worktree_exists; then return 0; fi
+  ensure_exclude
+  if branch_exists; then
+    git -C "$MAIN" worktree add "$WT_PATH" "$BRANCH"
+  else
+    git -C "$MAIN" worktree add -b "$BRANCH" "$WT_PATH" "$BASE"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# tmux
+# ---------------------------------------------------------------------------
+tmux_has_session() { tmux has-session -t "$1" >/dev/null 2>&1; }
+tmux_has_window() {
+  tmux list-windows -t "$1" -F '#{window_name}' 2>/dev/null | grep -qxF "$2"
+}
+
+# Spawn the window if it is missing, then select or attach to it. Re-running
+# with the same window name never starts a second process.
+spawn_window() {
+  local session=$1 window=$2 cwd=$3 cmd=$4
+  local -a args
+  if tmux_has_session "$session"; then
+    if tmux_has_window "$session" "$window"; then
+      tmux_focus "$session" "$window"
+      return 0
+    fi
+    args=(new-window -t "$session" -n "$window")
+  else
+    args=(new-session -d -s "$session" -n "$window")
+  fi
+  if [ -n "$cwd" ]; then args+=(-c "$cwd"); fi
+  if [ -n "$cmd" ]; then args+=("$cmd"); fi
+  tmux "${args[@]}"
+  tmux_focus "$session" "$window"
+}
+
+tmux_focus() {
+  local session=$1 window=$2 cur
+  if [ "$DETACHED" = 1 ]; then
+    if [ -z "${TMUX:-}" ]; then
+      printf 'kwt: detached; attach with: tmux attach -t %s\n' "$session"
+    fi
+    return 0
+  fi
+  if [ -n "${TMUX:-}" ]; then
+    cur=$(tmux display-message -p '#S' 2>/dev/null || true)
+    if [ "$cur" != "$session" ]; then
+      tmux switch-client -t "$session"
+    fi
+    tmux select-window -t "$session:$window"
+  else
+    if tmux_has_session "$session"; then
+      tmux select-window -t "$session:$window" >/dev/null 2>&1 || true
+    fi
+    tmux attach -t "$session"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Sandbox
+# ---------------------------------------------------------------------------
+KIT_BIN=""
+
+# Resolve kit once. `command -v` may return a symlink, so follow it: the
+# sandbox must bind the directory that really holds the binary.
+kit_binary() {
+  if [ -z "$KIT_BIN" ]; then
+    local found
+    found=$(command -v kit) || die "kit not found on PATH"
+    KIT_BIN=$(readlink -f "$found") || die "cannot resolve the kit binary at $found"
+  fi
+  printf '%s' "$KIT_BIN"
+}
+
+build_sandbox() {
+  local kit_dir t
+  kit_dir=$(dirname "$(kit_binary)")
+
+  SANDBOX_ARGV=(bwrap --die-with-parent
+    --ro-bind /usr /usr
+    --ro-bind /bin /bin
+    --ro-bind /lib /lib
+  )
+  if [ -d /lib64 ]; then SANDBOX_ARGV+=(--ro-bind /lib64 /lib64); fi
+  SANDBOX_ARGV+=(--ro-bind /etc /etc)
+  if [ -d /run ]; then SANDBOX_ARGV+=(--ro-bind /run /run); fi
+  SANDBOX_ARGV+=(--dev /dev --proc /proc --bind /tmp /tmp)
+
+  # The Worktree is the single writable work area.
+  SANDBOX_ARGV+=(--bind "$WT_PATH" "$WT_PATH")
+
+  # Git state: read-only by default, writable only when explicitly allowed.
+  if [ "$ALLOW_GIT_WRITE" = 1 ]; then
+    SANDBOX_ARGV+=(--bind "$COMMON_DIR" "$COMMON_DIR")
+  else
+    SANDBOX_ARGV+=(--ro-bind "$COMMON_DIR" "$COMMON_DIR")
+  fi
+
+  # Shared dependency/env targets are always read-only.
+  for t in ${SHARED_TARGETS[@]+"${SHARED_TARGETS[@]}"}; do
+    SANDBOX_ARGV+=(--ro-bind "$t" "$t")
+  done
+
+  # Everything needed to run: the kit binary's directory and kit's config.
+  SANDBOX_ARGV+=(--ro-bind "$kit_dir" "$kit_dir")
+  if [ -e "$HOME/.config/kit" ]; then
+    SANDBOX_ARGV+=(--ro-bind "$HOME/.config/kit" "$HOME/.config/kit")
+  fi
+  if [ -e "$HOME/.kit.yml" ]; then
+    SANDBOX_ARGV+=(--ro-bind "$HOME/.kit.yml" "$HOME/.kit.yml")
+  fi
+
+  # kit's session store is writable so a sandboxed session can persist.
+  SANDBOX_ARGV+=(--bind "$HOME/.kit" "$HOME/.kit")
+
+  SANDBOX_ARGV+=(--chdir "$WT_PATH" --setenv HOME "$HOME" --setenv GIT_OPTIONAL_LOCKS 0)
+  SANDBOX_ARGV+=(--)
+  SANDBOX_ARGV+=("$@")
+}
+
+quote_join() {
+  local out="" a
+  for a in "$@"; do out+=$(printf '%q ' "$a"); done
+  printf '%s' "${out% }"
+}
+
+# ---------------------------------------------------------------------------
+# Plan
+# ---------------------------------------------------------------------------
+emit_plan() {
+  local i
+  printf 'worktree %s\n' "$WT_PATH"
+  printf 'branch %s\n' "$BRANCH"
+  if [ -n "$BASE" ]; then printf 'base %s\n' "$BASE"; fi
+  for i in "${!LINK_NAMES[@]}"; do
+    printf 'link %s %s\n' "${LINK_NAMES[$i]}" "${LINK_TARGETS[$i]}"
+  done
+  printf 'session %s\n' "$PROJECT"
+  printf 'window %s\n' "$WINDOW"
+  if [ "${#SANDBOX_ARGV[@]}" -gt 0 ]; then
+    printf 'sandbox %s\n' "$(quote_join "${SANDBOX_ARGV[@]}")"
+  fi
+  if [ "$DETACHED" = 1 ]; then printf 'attach %s\n' "$PROJECT"; fi
+}
+
+# ---------------------------------------------------------------------------
+# `kwt <branch>`
+# ---------------------------------------------------------------------------
+cmd_branch() {
+  local branch="" base="" detached=0 allow_git_write=0 dry_run=0
+  local -a prompt=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --) shift; prompt=("$@"); break ;;
+      -b|--base)
+        [ $# -ge 2 ] || die "$1 requires a value"
+        base=$2; shift 2 ;;
+      --base=*) base=${1#*=}; shift ;;
+      -d|--detached) detached=1; shift ;;
+      --allow-git-write) allow_git_write=1; shift ;;
+      --dry-run) dry_run=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "unknown option: $1" ;;
+      *)
+        if [ -n "$branch" ]; then die "unexpected argument: $1"; fi
+        branch=$1; shift ;;
+    esac
+  done
+  [ -n "$branch" ] || die "missing <branch>"
+
+  resolve_project
+  BRANCH=$branch
+  SLUG=$(slug_of "$BRANCH")
+  WT_PATH=$(worktree_path "$SLUG")
+  DETACHED=$detached
+  DRY_RUN=$dry_run
+  ALLOW_GIT_WRITE=$allow_git_write
+  PROMPT=()
+  if [ "${#prompt[@]}" -gt 0 ]; then PROMPT=("${prompt[@]}"); fi
+  WINDOW=$SLUG
+
+  if [ -z "$base" ]; then
+    BASE=$(git -C "$MAIN" rev-parse --verify HEAD 2>/dev/null) || die "cannot resolve the current HEAD"
+  else
+    BASE=$(git -C "$MAIN" rev-parse --verify "${base}^{commit}" 2>/dev/null) \
+      || die "cannot resolve base '$base'"
+  fi
+
+  compute_links
+  compute_shared_targets
+  local -a kit_argv=(--no-daemon)
+  if [ "${#PROMPT[@]}" -gt 0 ]; then kit_argv+=("${PROMPT[@]}"); fi
+  build_sandbox "$(kit_binary)" "${kit_argv[@]}"
+
+  if [ "$DRY_RUN" = 1 ]; then
+    emit_plan
+    return 0
+  fi
+
+  ensure_worktree
+  create_links
+  mkdir -p "$HOME/.kit"
+  spawn_window "$PROJECT" "$WINDOW" "" "$(quote_join "${SANDBOX_ARGV[@]}")"
+}
+
+# ---------------------------------------------------------------------------
+# `kwt shell <branch>`
+# ---------------------------------------------------------------------------
+cmd_shell() {
+  local branch="" create=0 sandboxed=0 dry_run=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --) shift; break ;;
+      --create) create=1; shift ;;
+      --sandboxed) sandboxed=1; shift ;;
+      --dry-run) dry_run=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "unknown option: $1" ;;
+      *)
+        if [ -n "$branch" ]; then die "unexpected argument: $1"; fi
+        branch=$1; shift ;;
+    esac
+  done
+  [ -n "$branch" ] || die "missing <branch>"
+
+  resolve_project
+  BRANCH=$branch
+  SLUG=$(slug_of "$BRANCH")
+  WT_PATH=$(worktree_path "$SLUG")
+  DRY_RUN=$dry_run
+  ALLOW_GIT_WRITE=0
+  WINDOW="$SLUG~"
+
+  local exists=0
+  if worktree_exists; then exists=1; fi
+  if [ "$exists" = 0 ] && [ "$create" = 0 ]; then
+    die "no Worktree for '$branch' at $WT_PATH; run: kwt $branch"
+  fi
+  if [ "$exists" = 0 ]; then
+    BASE=$(git -C "$MAIN" rev-parse --verify HEAD 2>/dev/null) || die "cannot resolve the current HEAD"
+  fi
+
+  compute_links
+  if [ "$sandboxed" = 1 ]; then
+    compute_shared_targets
+    build_sandbox "${SHELL:-/bin/bash}"
+  fi
+
+  if [ "$DRY_RUN" = 1 ]; then
+    emit_plan
+    return 0
+  fi
+
+  if [ "$exists" = 0 ]; then
+    ensure_worktree
+    create_links
+  fi
+
+  local cwd="$WT_PATH" cmd=""
+  if [ "$sandboxed" = 1 ]; then
+    mkdir -p "$HOME/.kit"
+    cmd=$(quote_join "${SANDBOX_ARGV[@]}")
+  fi
+  spawn_window "$PROJECT" "$WINDOW" "$cwd" "$cmd"
+}
+
+# ---------------------------------------------------------------------------
+# Worktree listing
+# ---------------------------------------------------------------------------
+# Emit `<path>\t<branch>` for every Worktree of the Project: the entries under
+# the Main checkout's .worktrees directory.
+list_worktrees() {
+  local line path="" branch=""
+  local root="$MAIN/.worktrees"
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ -z "$line" ]; then
+      case "$path" in "$root"/*) printf '%s\t%s\n' "$path" "$branch" ;; esac
+      path=""; branch=""; continue
+    fi
+    case "$line" in
+      "worktree "*) path=${line#worktree } ;;
+      "branch refs/heads/"*) branch=${line#branch refs/heads/} ;;
+    esac
+  done < <(git -C "$MAIN" worktree list --porcelain)
+  case "$path" in "$root"/*) printf '%s\t%s\n' "$path" "$branch" ;; esac
+}
+
+# ---------------------------------------------------------------------------
+# `kwt ls`
+# ---------------------------------------------------------------------------
+cmd_ls() {
+  resolve_project
+  local path branch slug status
+  while IFS=$'\t' read -r path branch; do
+    if [ "$path" = "$MAIN" ]; then continue; fi
+    if [ -n "$branch" ]; then
+      slug=$(slug_of "$branch")
+    else
+      slug=$(basename "$path")
+    fi
+    if tmux_has_window "$PROJECT" "$slug"; then
+      status=running
+    else
+      status=stopped
+    fi
+    printf '%s %s %s\n' "$status" "$slug" "$path"
+  done < <(list_worktrees)
+}
+
+# ---------------------------------------------------------------------------
+# `kwt rm [<branch>]`
+# ---------------------------------------------------------------------------
+cmd_rm() {
+  local branch="" force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "unknown option: $1" ;;
+      *)
+        if [ -n "$branch" ]; then die "unexpected argument: $1"; fi
+        branch=$1; shift ;;
+    esac
+  done
+
+  resolve_project
+  local path b slug
+  if [ -z "$branch" ]; then
+    local -a slugs=()
+    while IFS=$'\t' read -r path b; do
+      if [ "$path" = "$MAIN" ]; then continue; fi
+      if [ -n "$b" ]; then slugs+=("$(slug_of "$b")"); else slugs+=("$(basename "$path")"); fi
+    done < <(list_worktrees)
+    [ "${#slugs[@]}" -gt 0 ] || die "no Worktrees to remove"
+    printf 'Select a Worktree to remove:\n' >&2
+    select slug in "${slugs[@]}"; do
+      if [ -n "$slug" ]; then
+        branch=$slug
+        break
+      fi
+    done
+    [ -n "$branch" ] || die "no Worktree selected"
+  fi
+
+  SLUG=$(slug_of "$branch")
+  WT_PATH=$(worktree_path "$SLUG")
+
+  local found=0
+  while IFS=$'\t' read -r path b; do
+    if [ "$path" = "$WT_PATH" ]; then found=1; break; fi
+  done < <(list_worktrees)
+  if [ "$found" = 0 ]; then
+    die "no Worktree for '$branch' at $WT_PATH"
+  fi
+
+  if tmux_has_window "$PROJECT" "$SLUG" && [ "$force" = 0 ]; then
+    die "a kit session is running for '$branch'; pass --force to remove it"
+  fi
+
+  tmux kill-window -t "$PROJECT:$SLUG" >/dev/null 2>&1 || true
+  tmux kill-window -t "$PROJECT:$SLUG~" >/dev/null 2>&1 || true
+  git -C "$MAIN" worktree remove --force "$WT_PATH"
+}
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+main() {
+  if [ $# -eq 0 ]; then
+    usage >&2
+    exit 2
+  fi
+  case "$1" in
+    shell) shift; cmd_shell "$@" ;;
+    ls) shift; cmd_ls "$@" ;;
+    rm) shift; cmd_rm "$@" ;;
+    -h|--help|help) usage; exit 0 ;;
+    -*) die "unknown option: $1" ;;
+    *) cmd_branch "$@" ;;
+  esac
+}
+
+main "$@"
