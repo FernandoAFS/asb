@@ -29,7 +29,7 @@ import (
 //
 // It deliberately does NOT police destructive commands (rm -rf, mkfs, dd,
 // chmod 777, writes to /dev). Those do not prompt on their own, and inside a
-// kwt sandbox bwrap already denies everything outside the writable Target directory —
+// sandbox bwrap already denies everything outside the writable Target directory —
 // a read-only bind cannot be removed and the sandbox root is a throwaway tmpfs.
 // Blocking them here would only add false positives (e.g. `rm -rf node_modules`)
 // for commands the sandbox was always going to contain.
@@ -43,7 +43,7 @@ import (
 //	options:
 //	  headless: true
 //
-// kwt sets KIT_OPT_HEADLESS=true for every kit launch, so a worker starts
+// asb sets KIT_OPT_HEADLESS=true for every kit launch, so a worker starts
 // headless by default and can be made interactive again with /headless off.
 //
 // Load order matters: Kit runs OnToolCall handlers in extension load order and

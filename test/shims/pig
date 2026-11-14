@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# pig shim: records argv and exits without starting a session.
+set -u
+printf 'pig %s\n' "$*" >>"${SHIM_LOG:?SHIM_LOG is not set}"
+exit 0

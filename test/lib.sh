@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Shared helpers for the kwt black-box tests.
+# Shared helpers for the asb black-box tests.
 #
-# Tests drive the kwt executable as a subprocess and assert only on externally
+# Tests drive the asb executable as a subprocess and assert only on externally
 # observable results: the printed plan, filesystem state, and the recorded argv
 # of external tools. bwrap and kit are replaced by PATH shims; git runs for
 # real inside throwaway repositories.
 set -u
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-KW="$ROOT/kwt"
+ASB="$ROOT/asb"
 SHIMDIR="$ROOT/test/shims"
 
 PASS=0
@@ -75,6 +75,12 @@ mk_env() {
   : >"$SHIM_LOG"
   export PATH="$SHIMDIR:$PATH"
   unset EDITOR VISUAL 2>/dev/null || true
+  # The configuration roots and editor mounts follow the XDG and PiG/Pi
+  # variables, so clear them: tests must not inherit the developer's paths.
+  # A test that needs one sets it explicitly.
+  unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME
+  unset PIG_HOME PIG_CODING_AGENT_DIR PIG_CODING_AGENT_SESSION_DIR PIG_USE_PI_DIRS
+  unset PI_CODING_AGENT_DIR PI_CODING_AGENT_SESSION_DIR
   mkdir -p "$SB/proj"
   (
     cd "$SB/proj" || exit 1
@@ -92,4 +98,6 @@ project_commit() {
   git -C "$SB/proj" commit -q -m "${1:-commit}"
 }
 
-run_kwt() { "$KW" "$@"; }
+run_asb() { "$ASB" "$@"; }
+run_kit() { "$ASB" kit "$@"; }
+run_pig() { "$ASB" pig "$@"; }

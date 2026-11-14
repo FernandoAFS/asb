@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Integration test: run the real bwrap sandbox produced by kwt.
+# Integration test: run the real bwrap sandbox produced by asb.
 #
-# Unlike the other suites, this one runs actual bwrap with the argv kwt builds,
+# Unlike the other suites, this one runs actual bwrap with the argv asb builds,
 # and has a probe "kit" report what the sandbox allowed. It skips itself when
 # bwrap cannot be run (e.g. no unprivileged user namespaces).
 . "$(dirname "$0")/lib.sh"
@@ -37,7 +37,7 @@ PROBE
 t_real_sandbox_policy() {
   mk_env
   install_probe_kit
-  run_kwt . >/dev/null 2>&1
+  run_kit . >/dev/null 2>&1
   probe="$SB/proj/sandbox-probe.out"
   assert_file "$probe"
   out=$(cat "$probe")
@@ -52,7 +52,7 @@ t_real_sandbox_policy() {
 t_real_sandbox_git_writable_flag() {
   mk_env
   install_probe_kit
-  run_kwt . --allow-git-write >/dev/null 2>&1
+  run_kit . --allow-git-write >/dev/null 2>&1
   probe="$SB/proj/sandbox-probe.out"
   assert_file "$probe"
   out=$(cat "$probe")

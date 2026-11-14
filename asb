@@ -1,0 +1,495 @@
+#!/usr/bin/env bash
+#
+# asb — run an AI coding agent in a bwrap sandbox
+#
+# Runs an agent inside a default-deny bwrap sandbox rooted at a directory. The
+# directory is the only writable source tree; the Project's git state, the
+# host's tools, the agent's configuration, and the user's agent skills are
+# mounted read-only — except an agent's configuration, which may be a
+# copy-on-write overlay when the agent writes lock files to read it. The agent profile is explicit: `asb kit` and `asb pig`.
+# `--shell` runs a shell in the same sandbox for debugging. See
+# .scratch/kwt/spec.md for the specification.
+#
+set -euo pipefail
+
+PROG=asb
+
+# ---------------------------------------------------------------------------
+# State populated by command parsing and resolution.
+# ---------------------------------------------------------------------------
+AGENT=""
+PROFILE=""
+AGENT_CMD=""
+DIR_ARG=""
+AGENT_ARGS=()
+TARGET_DIR=""
+GIT_DIRS=()
+ALLOW_GIT_WRITE=0
+DRY_RUN=0
+SHELL_MODE=0
+HEADLESS=0
+SANDBOX_ARGV=()
+RO_BIND_SOURCES=()
+PRIVATE_PATHS=()
+
+die() { printf '%s: error: %s\n' "$PROG" "$*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+usage:
+  $PROG [<options>] <agent> [<dir>] [-- <args>...]
+
+agents:
+  kit                   run kit
+  pig                   run pig
+
+options:
+      --allow-git-write make git state writable inside the sandbox
+      --dry-run         print the plan and perform no side effects
+      --shell           run \$SHELL in the agent's sandbox (debugging)
+  -h, --help            show this help
+
+<dir> defaults to the current directory. Arguments after -- are passed to the
+agent, or to the shell when --shell is given.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Resolution
+# ---------------------------------------------------------------------------
+# Resolve the Target directory to an absolute path. The filesystem root is
+# refused: making it writable would defeat the sandbox.
+resolve_dir() {
+  local dir=$1
+  [ -d "$dir" ] || die "not a directory: $dir"
+  TARGET_DIR=$(cd "$dir" && pwd -P)
+  if [ "$TARGET_DIR" = "/" ]; then
+    die "refusing to sandbox the filesystem root"
+  fi
+}
+
+# Absolute git directories for the Target directory. Empty when the Target is
+# not a git checkout root. Both the checkout's git dir and the common dir are
+# returned when they differ.
+resolve_git_dirs() {
+  GIT_DIRS=()
+  [ -e "$TARGET_DIR/.git" ] || return 0
+  local common gitdir
+  common=$(git -C "$TARGET_DIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 0
+  gitdir=$(git -C "$TARGET_DIR" rev-parse --path-format=absolute --git-dir 2>/dev/null) || gitdir=$common
+  common=$(cd "$common" 2>/dev/null && pwd -P) || return 0
+  GIT_DIRS+=("$common")
+  gitdir=$(cd "$gitdir" 2>/dev/null && pwd -P) || gitdir=""
+  if [ -n "$gitdir" ] && [ "$gitdir" != "$common" ]; then
+    GIT_DIRS+=("$gitdir")
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Agent profiles
+# ---------------------------------------------------------------------------
+# The sandbox policy is identical for every agent. A profile supplies only the
+# agent binary, the configuration it may read, and the arguments it launches
+# with. The agent is always explicit: there is no agent-less sandbox, because
+# the profile is what decides the payload.
+select_agent() {
+  AGENT=$1
+  case "$AGENT" in
+    kit)
+      PROFILE=kit
+      AGENT_CMD=kit
+      # Kit's session store is deliberately never mounted (sessions are
+      # ephemeral), and a PATH directory under it stays excluded too.
+      PRIVATE_PATHS=("$HOME/.kit")
+      ;;
+    pig)
+      PROFILE=pig
+      AGENT_CMD=pig
+      # Pig's session store lives inside its configuration root; keep both out
+      # of the read-only tool mounts.
+      PRIVATE_PATHS=("$(pig_config_root)" "$(pig_agent_dir "$(pig_config_root)")")
+      ;;
+    *)
+      die "unknown agent: $AGENT (expected: kit, pig)"
+      ;;
+  esac
+}
+
+AGENT_BIN=""
+
+# Resolve the agent once. `command -v` may return a symlink, so follow it: the
+# sandbox must bind the directory that really holds the binary.
+agent_binary() {
+  if [ -z "$AGENT_BIN" ]; then
+    local found
+    found=$(command -v "$AGENT_CMD") || die "$AGENT_CMD not found on PATH"
+    AGENT_BIN=$(readlink -f "$found") || die "cannot resolve the $AGENT_CMD binary at $found"
+  fi
+  printf '%s' "$AGENT_BIN"
+}
+
+# Kit reads its configuration from $XDG_CONFIG_HOME (default ~/.config): the
+# `kit` directory holds settings, and `.kit` holds provider credentials and MCP
+# tokens. Both are mounted read-only so a sandboxed session can authenticate but
+# cannot write secrets. $HOME/.kit.yml holds options.
+bind_kit_config() {
+  local config_home
+  config_home=${XDG_CONFIG_HOME:-$HOME/.config}
+  if [ -e "$config_home/kit" ]; then
+    add_ro_bind "$config_home/kit"
+  fi
+  if [ -e "$config_home/.kit" ]; then
+    add_ro_bind "$config_home/.kit"
+  fi
+  if [ -e "$HOME/.kit.yml" ]; then
+    add_ro_bind "$HOME/.kit.yml"
+  fi
+}
+
+# Pig's configuration root, resolved the way Pig resolves it: $PIG_HOME first,
+# then $XDG_CONFIG_HOME/pig, then ~/.pig.
+pig_config_root() {
+  if [ -n "${PIG_HOME:-}" ]; then
+    printf '%s' "$PIG_HOME"
+  elif [ -n "${XDG_CONFIG_HOME:-}" ]; then
+    printf '%s/pig' "$XDG_CONFIG_HOME"
+  else
+    printf '%s/.pig' "$HOME"
+  fi
+}
+
+# Pig's agent directory: its own under the configuration root by default, or
+# Pi's when shared directories are selected.
+pig_agent_dir() {
+  local root=$1
+  if [ "${PIG_USE_PI_DIRS:-}" = 1 ]; then
+    printf '%s' "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+  else
+    printf '%s' "${PIG_CODING_AGENT_DIR:-$root/agent}"
+  fi
+}
+
+# Replace a session store with an empty read-only directory. The store lives
+# inside the configuration, so this overlays it: a sandboxed session cannot
+# read another session's transcript, and nothing outside the Target becomes
+# writable.
+hide_session_store() {
+  local dir=$1
+  [ -e "$dir" ] || return 0
+  SANDBOX_ARGV+=(--tmpfs "$dir" --remount-ro "$dir")
+}
+
+# Mount DIR as a copy-on-write overlay: reads come from the host, writes go to
+# an invisible tmpfs, and the host tree is never modified.
+overlay_dir() {
+  local dir=$1
+  [ -d "$dir" ] || return 0
+  SANDBOX_ARGV+=(--overlay-src "$dir" --tmp-overlay "$dir")
+}
+
+# Pig creates lock files and mutable state in its configuration even to read it
+# (for example `trust.json.lock` while resolving project trust), so a read-only
+# bind fails with EROFS. Mount the configuration root as a copy-on-write overlay
+# instead. Its session store lives inside the configuration, so it is hidden
+# rather than mounted. The agent directory can move independently of the root
+# (`PIG_CODING_AGENT_DIR`, or Pi's directory in shared mode), so it is overlaid
+# separately when the root does not already cover it.
+bind_pig_config() {
+  local root agent_dir s d dup
+  root=$(pig_config_root)
+  agent_dir=$(pig_agent_dir "$root")
+
+  overlay_dir "$root"
+  case "$agent_dir" in
+    "$root"|"$root"/*)
+      # Covered by the root overlay, unless the root itself is absent.
+      [ -d "$root" ] || overlay_dir "$agent_dir"
+      ;;
+    *)
+      overlay_dir "$agent_dir"
+      ;;
+  esac
+
+  # Replace every reachable session store with an empty read-only directory:
+  # the default under the agent directory, and any store an environment
+  # variable names.
+  local -a seen=()
+  for s in \
+    "$agent_dir/sessions" \
+    "$root/agent/sessions" \
+    "${PIG_CODING_AGENT_SESSION_DIR:-}" \
+    "${PI_CODING_AGENT_SESSION_DIR:-}"; do
+    [ -n "$s" ] || continue
+    [ -e "$s" ] || continue
+    dup=0
+    for d in ${seen[@]+"${seen[@]}"}; do [ "$s" = "$d" ] && dup=1; done
+    [ "$dup" = 1 ] && continue
+    seen+=("$s")
+    hide_session_store "$s"
+  done
+}
+
+bind_agent_config() {
+  case "$PROFILE" in
+    kit) bind_kit_config ;;
+    pig) bind_pig_config ;;
+  esac
+}
+
+# Environment a launched agent needs. Kit starts its headless extension so an
+# unattended session cannot block on a question or a privilege prompt. Pig has
+# no equivalent switch, so it adds nothing.
+agent_headless_env() {
+  case "$PROFILE" in
+    kit) SANDBOX_ARGV+=(--setenv KIT_OPT_HEADLESS true) ;;
+    pig) : ;;
+  esac
+}
+
+# Arguments the launched agent runs with. Both agents are launched without a
+# durable session; kit is additionally launched without its daemon, which would
+# otherwise hand the session to a host process outside the sandbox. Arguments
+# from the command line follow the launcher's own flags.
+LAUNCH_ARGV=()
+agent_launch_argv() {
+  case "$PROFILE" in
+    kit) LAUNCH_ARGV=(--no-daemon --no-session) ;;
+    pig) LAUNCH_ARGV=(--no-session) ;;
+  esac
+  if [ "${#AGENT_ARGS[@]}" -gt 0 ]; then
+    LAUNCH_ARGV+=("${AGENT_ARGS[@]}")
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Sandbox
+# ---------------------------------------------------------------------------
+# Record a read-only bind unless an earlier mount already covers it. The
+# system directories are mounted wholesale, and a bind of a parent directory
+# already covers its children.
+ro_bind_covered() {
+  local path=$1 existing
+  case "$path" in
+    /usr|/usr/*|/bin|/bin/*|/lib|/lib/*|/lib64|/lib64/*|/etc|/etc/*|/run|/run/*) return 0 ;;
+  esac
+  for existing in ${RO_BIND_SOURCES[@]+"${RO_BIND_SOURCES[@]}"}; do
+    if [ "$path" = "$existing" ]; then return 0; fi
+    case "$path" in "$existing"/*) return 0 ;; esac
+  done
+  return 1
+}
+
+add_ro_bind() {
+  local path=$1
+  if ro_bind_covered "$path"; then return 0; fi
+  RO_BIND_SOURCES+=("$path")
+  SANDBOX_ARGV+=(--ro-bind "$path" "$path")
+}
+
+# Tools that live outside the system directories — `uvx`, cargo, pnpm and the
+# like — are reached through PATH. Mount each PATH directory read-only so a
+# sandboxed session can run them; a tool that is a symlink into another
+# directory also needs its real target mounted, or the link dangles.
+bind_path_tools() {
+  local dir resolved entry target s private
+  local -a seen=()
+  while IFS= read -r dir; do
+    [ -n "$dir" ] || continue
+    [ -d "$dir" ] || continue
+    resolved=$(readlink -f "$dir") || continue
+    [ "$resolved" = "/" ] && continue
+    # The Target directory and /tmp are bound separately, and each agent's
+    # session store is deliberately never mounted (sessions are ephemeral).
+    case "$resolved" in
+      "$TARGET_DIR"|"$TARGET_DIR"/*|/tmp) continue ;;
+    esac
+    for private in ${PRIVATE_PATHS[@]+"${PRIVATE_PATHS[@]}"}; do
+      case "$resolved" in "$private"|"$private"/*) continue 2 ;; esac
+    done
+    for s in ${seen[@]+"${seen[@]}"}; do
+      [ "$resolved" = "$s" ] && continue 2
+    done
+    seen+=("$resolved")
+    if ro_bind_covered "$resolved"; then continue; fi
+    add_ro_bind "$resolved"
+    for entry in "$resolved"/*; do
+      [ -L "$entry" ] || continue
+      [ -x "$entry" ] || continue
+      target=$(readlink -f "$entry") || continue
+      add_ro_bind "$(dirname "$target")"
+    done
+  done < <(printf '%s\n' "${PATH:-}" | tr ':' '\n')
+}
+
+# The developer edits files inside the agent with $EDITOR, which is vim or nvim.
+# Mount that editor's configuration, plugin, and runtime directories so a
+# sandboxed session has the developer's setup and plugins. They are all
+# read-only. nvim's state directory (undo history, shada, and swap) is not
+# mounted at all: the sandbox points XDG_STATE_HOME at a private tmpfs, so a
+# session starts with no history and writes nothing back. $EDITOR may carry
+# arguments (`nvim -f`) or a path; only the program name matters. Directories
+# that do not exist are skipped, so a bare editor install adds no mounts.
+bind_editor_config() {
+  local editor=${EDITOR:-}
+  local config_home data_home cache_home
+  editor=${editor%% *}
+  [ -n "$editor" ] || return 0
+  editor=$(basename "$editor")
+  config_home=${XDG_CONFIG_HOME:-$HOME/.config}
+  case "$editor" in
+    nvim)
+      data_home=${XDG_DATA_HOME:-$HOME/.local/share}
+      cache_home=${XDG_CACHE_HOME:-$HOME/.cache}
+      if [ -e "$config_home/nvim" ]; then add_ro_bind "$config_home/nvim"; fi
+      if [ -e "$data_home/nvim" ]; then add_ro_bind "$data_home/nvim"; fi
+      if [ -e "$cache_home/nvim" ]; then add_ro_bind "$cache_home/nvim"; fi
+      # nvim keeps undo history, shada, and swap under XDG_STATE_HOME. Do not
+      # mount the host's state: point nvim at a private tmpfs so a session
+      # starts with no history and writes nothing back. The tmpfs is mounted
+      # inside the sandbox's own mount namespace, so sessions do not share it.
+      SANDBOX_ARGV+=(--tmpfs /tmp/asb-state --setenv XDG_STATE_HOME /tmp/asb-state)
+      ;;
+    vim|vi)
+      if [ -e "$config_home/vim" ]; then add_ro_bind "$config_home/vim"; fi
+      if [ -e "$HOME/.vim" ]; then add_ro_bind "$HOME/.vim"; fi
+      if [ -e "$HOME/.vimrc" ]; then add_ro_bind "$HOME/.vimrc"; fi
+      ;;
+  esac
+}
+
+build_sandbox() {
+  local agent_dir t
+  RO_BIND_SOURCES=()
+
+  SANDBOX_ARGV=(bwrap --die-with-parent
+    --ro-bind /usr /usr
+    --ro-bind /bin /bin
+    --ro-bind /lib /lib
+  )
+  if [ -d /lib64 ]; then SANDBOX_ARGV+=(--ro-bind /lib64 /lib64); fi
+  SANDBOX_ARGV+=(--ro-bind /etc /etc)
+  if [ -d /run ]; then SANDBOX_ARGV+=(--ro-bind /run /run); fi
+  SANDBOX_ARGV+=(--dev /dev --proc /proc --bind /tmp /tmp)
+
+  # The Target directory is the single writable work area.
+  SANDBOX_ARGV+=(--bind "$TARGET_DIR" "$TARGET_DIR")
+
+  # Git state: read-only by default, writable only when explicitly allowed.
+  for t in ${GIT_DIRS[@]+"${GIT_DIRS[@]}"}; do
+    if [ "$ALLOW_GIT_WRITE" = 1 ]; then
+      SANDBOX_ARGV+=(--bind "$t" "$t")
+    else
+      SANDBOX_ARGV+=(--ro-bind "$t" "$t")
+    fi
+  done
+
+  # Every tool directory on PATH, so sandboxed sessions can run the same
+  # commands the host can.
+  bind_path_tools
+
+  # The agent binary's directory is bound for an agent launch. A debug shell
+  # does not need it, and PATH already covers it when the agent is installed.
+  if [ "$SHELL_MODE" = 0 ]; then
+    agent_dir=$(dirname "$(agent_binary)")
+    add_ro_bind "$agent_dir"
+  fi
+  bind_agent_config
+
+  # User-level agent skills are readable but never writable from a sandboxed
+  # session, so an agent cannot rewrite the instructions it runs under.
+  if [ -e "$HOME/.agents" ]; then
+    add_ro_bind "$HOME/.agents"
+  fi
+
+  # The developer's editor setup, read-only, so a sandboxed session can edit
+  # with vim or nvim as configured but cannot rewrite that configuration.
+  bind_editor_config
+
+  # An agent launch is unattended by definition, so ask the agent's headless
+  # mode to start active where one exists (see agent_headless_env). A debug
+  # shell is interactive and does not.
+  if [ "$HEADLESS" = 1 ]; then
+    agent_headless_env
+  fi
+
+  SANDBOX_ARGV+=(--chdir "$TARGET_DIR" --setenv HOME "$HOME" --setenv GIT_OPTIONAL_LOCKS 0)
+  SANDBOX_ARGV+=(--)
+  SANDBOX_ARGV+=("$@")
+}
+
+quote_join() {
+  local out="" a
+  for a in "$@"; do out+=$(printf '%q ' "$a"); done
+  printf '%s' "${out% }"
+}
+
+# ---------------------------------------------------------------------------
+# Plan
+# ---------------------------------------------------------------------------
+emit_plan() {
+  printf 'dir %s\n' "$TARGET_DIR"
+  if [ "${#SANDBOX_ARGV[@]}" -gt 0 ]; then
+    printf 'sandbox %s\n' "$(quote_join "${SANDBOX_ARGV[@]}")"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Command line
+# ---------------------------------------------------------------------------
+# Parse the launcher's options and positionals. `--` ends the launcher's own
+# arguments: everything after it is passed to the agent, or to the shell with
+# --shell, so agent flags never collide with the launcher's.
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --) shift; AGENT_ARGS=("$@"); break ;;
+      --allow-git-write) ALLOW_GIT_WRITE=1; shift ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      --shell) SHELL_MODE=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "unknown option: $1" ;;
+      *)
+        if [ -z "$AGENT" ]; then
+          AGENT=$1
+        elif [ -z "$DIR_ARG" ]; then
+          DIR_ARG=$1
+        else
+          die "unexpected argument: $1"
+        fi
+        shift ;;
+    esac
+  done
+}
+
+run() {
+  [ -n "$AGENT" ] || die "an agent is required (kit or pig)"
+  select_agent "$AGENT"
+  resolve_dir "${DIR_ARG:-.}"
+  resolve_git_dirs
+
+  if [ "$SHELL_MODE" = 1 ]; then
+    HEADLESS=0
+    build_sandbox "${SHELL:-/bin/bash}" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}
+  else
+    HEADLESS=1
+    agent_launch_argv
+    build_sandbox "$(agent_binary)" "${LAUNCH_ARGV[@]}"
+  fi
+
+  if [ "$DRY_RUN" = 1 ]; then
+    emit_plan
+    return 0
+  fi
+
+  exec "${SANDBOX_ARGV[@]}"
+}
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+main() {
+  parse_args "$@"
+  run
+}
+
+main "$@"

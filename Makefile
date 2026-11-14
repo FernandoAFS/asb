@@ -1,6 +1,6 @@
-# kwt — install the sandbox launcher and its kit extension.
+# asb — install the sandbox launcher and its kit extension.
 #
-#   make install     install the kwt script and the headless kit extension
+#   make install     install the asb script and the headless kit extension
 #   make test        run the test suite
 #   make uninstall   remove what install created
 #
@@ -12,7 +12,7 @@
 
 SHELL := /bin/bash
 
-# The kwt script lands in a local bin directory. PREFIX defaults to ~/.local,
+# The asb script lands in a local bin directory. PREFIX defaults to ~/.local,
 # which puts it in ~/.local/bin — on PATH on most setups.
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
@@ -23,7 +23,7 @@ BINDIR ?= $(PREFIX)/bin
 XDG_CONFIG_HOME ?= $(HOME)/.config
 EXT_DIR ?= $(XDG_CONFIG_HOME)/kit/extensions
 
-KWT := kwt
+ASB := asb
 EXT := extensions/00-headless.go
 EXT_NAME := $(notdir $(EXT))
 
@@ -33,13 +33,13 @@ all: help
 
 help:
 	@printf '%s\n' \
-	  'kwt' \
+	  'asb' \
 	  '' \
-	  '  make install            install the kwt script and the kit extension' \
-	  '  make install-script     install the kwt script into $(BINDIR)' \
+	  '  make install            install the launcher and the kit extension' \
+	  '  make install-script     install the launcher into $(BINDIR)' \
 	  '  make install-extension  install the kit extension into $(EXT_DIR)' \
 	  '  make test               run the test suite' \
-	  '  make uninstall          remove the installed script and extension' \
+	  '  make uninstall          remove the installed launcher and extension' \
 	  '' \
 	  'Override paths with PREFIX=... BINDIR=... EXT_DIR=...' \
 	  '(and DESTDIR=... for staged installs).'
@@ -48,10 +48,10 @@ help:
 # makes a sandboxed kit session start headless.
 install: install-script install-extension
 
-install-script: $(KWT)
+install-script: $(ASB)
 	install -d $(DESTDIR)$(BINDIR)
-	install -m 0755 $(KWT) $(DESTDIR)$(BINDIR)/kwt
-	@printf 'installed %s\n' "$(DESTDIR)$(BINDIR)/kwt"
+	install -m 0755 $(ASB) $(DESTDIR)$(BINDIR)/asb
+	@printf 'installed %s\n' "$(DESTDIR)$(BINDIR)/asb"
 
 install-extension: $(EXT)
 	install -d $(DESTDIR)$(EXT_DIR)
@@ -59,9 +59,9 @@ install-extension: $(EXT)
 	@printf 'installed %s\n' "$(DESTDIR)$(EXT_DIR)/$(EXT_NAME)"
 
 uninstall:
-	rm -f $(DESTDIR)$(BINDIR)/kwt
+	rm -f $(DESTDIR)$(BINDIR)/asb
 	rm -f $(DESTDIR)$(EXT_DIR)/$(EXT_NAME)
-	@printf 'removed %s and %s\n' "$(DESTDIR)$(BINDIR)/kwt" "$(DESTDIR)$(EXT_DIR)/$(EXT_NAME)"
+	@printf 'removed %s and %s\n' "$(DESTDIR)$(BINDIR)/asb" "$(DESTDIR)$(EXT_DIR)/$(EXT_NAME)"
 
 test:
 	bash test/run.sh
