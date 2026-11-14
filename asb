@@ -270,7 +270,7 @@ agent_launch_argv() {
 ro_bind_covered() {
   local path=$1 existing
   case "$path" in
-    /usr|/usr/*|/bin|/bin/*|/lib|/lib/*|/lib64|/lib64/*|/etc|/etc/*|/run|/run/*) return 0 ;;
+    /usr|/usr/*|/bin|/bin/*|/lib|/lib/*|/lib64|/lib64/*) return 0 ;;
   esac
   for existing in ${RO_BIND_SOURCES[@]+"${RO_BIND_SOURCES[@]}"}; do
     if [ "$path" = "$existing" ]; then return 0; fi
@@ -284,6 +284,48 @@ add_ro_bind() {
   if ro_bind_covered "$path"; then return 0; fi
   RO_BIND_SOURCES+=("$path")
   SANDBOX_ARGV+=(--ro-bind "$path" "$path")
+}
+
+# /etc is not mounted wholesale. Its contents include credentials and machine
+# identity (SSH host keys, shadow, machine-id), and almost none of it is needed
+# to run an agent. Mount only the entries that keep the runtime working: dynamic
+# linking, identity lookup, DNS, TLS trust, locale/time, shell startup, and the
+# small data files common tools read. Everything else in /etc stays absent.
+bind_etc() {
+  local path
+  for path in \
+    /etc/ld.so.cache \
+    /etc/ld.so.conf \
+    /etc/ld.so.conf.d \
+    /etc/nsswitch.conf \
+    /etc/passwd \
+    /etc/group \
+    /etc/hosts \
+    /etc/resolv.conf \
+    /etc/gai.conf \
+    /etc/host.conf \
+    /etc/services \
+    /etc/protocols \
+    /etc/localtime \
+    /etc/timezone \
+    /etc/ssl/certs \
+    /etc/ssl/cert.pem \
+    /etc/ssl/openssl.cnf \
+    /etc/ca-certificates \
+    /etc/pki/tls/certs \
+    /etc/pki/ca-trust \
+    /etc/inputrc \
+    /etc/bash.bashrc \
+    /etc/profile \
+    /etc/profile.d \
+    /etc/shells \
+    /etc/mime.types \
+    /etc/fonts \
+    /etc/terminfo \
+    /etc/os-release; do
+    [ -e "$path" ] || continue
+    add_ro_bind "$path"
+  done
 }
 
 # Tools that live outside the system directories — `uvx`, cargo, pnpm and the
@@ -322,16 +364,18 @@ bind_path_tools() {
 }
 
 # The developer edits files inside the agent with $EDITOR, which is vim or nvim.
-# Mount that editor's configuration, plugin, and runtime directories so a
-# sandboxed session has the developer's setup and plugins. They are all
-# read-only. nvim's state directory (undo history, shada, and swap) is not
-# mounted at all: the sandbox points XDG_STATE_HOME at a private tmpfs, so a
-# session starts with no history and writes nothing back. $EDITOR may carry
-# arguments (`nvim -f`) or a path; only the program name matters. Directories
-# that do not exist are skipped, so a bare editor install adds no mounts.
+# Mount that editor's configuration and plugin directories so a sandboxed
+# session has the developer's setup and plugins. They are read-only. nvim's
+# state and cache directories are not mounted at all: the sandbox points
+# XDG_STATE_HOME and XDG_CACHE_HOME at private tmpfs directories, so a session
+# starts with no history and writes nothing back. The cache must be writable
+# because nvim compiles Lua bytecode there at startup; a read-only host cache
+# fails with EROFS. $EDITOR may carry arguments (`nvim -f`) or a path; only the
+# program name matters. Directories that do not exist are skipped, so a bare
+# editor install adds no mounts.
 bind_editor_config() {
   local editor=${EDITOR:-}
-  local config_home data_home cache_home
+  local config_home data_home
   editor=${editor%% *}
   [ -n "$editor" ] || return 0
   editor=$(basename "$editor")
@@ -339,15 +383,15 @@ bind_editor_config() {
   case "$editor" in
     nvim)
       data_home=${XDG_DATA_HOME:-$HOME/.local/share}
-      cache_home=${XDG_CACHE_HOME:-$HOME/.cache}
       if [ -e "$config_home/nvim" ]; then add_ro_bind "$config_home/nvim"; fi
       if [ -e "$data_home/nvim" ]; then add_ro_bind "$data_home/nvim"; fi
-      if [ -e "$cache_home/nvim" ]; then add_ro_bind "$cache_home/nvim"; fi
-      # nvim keeps undo history, shada, and swap under XDG_STATE_HOME. Do not
-      # mount the host's state: point nvim at a private tmpfs so a session
-      # starts with no history and writes nothing back. The tmpfs is mounted
-      # inside the sandbox's own mount namespace, so sessions do not share it.
+      # nvim keeps undo history, shada, and swap under XDG_STATE_HOME and
+      # compiled Lua bytecode and plugin caches under XDG_CACHE_HOME. Do not
+      # mount either host directory: point both at private tmpfs directories so
+      # a session starts clean and writes nothing back. The tmpfs mounts live
+      # in the sandbox's own mount namespace, so sessions do not share them.
       SANDBOX_ARGV+=(--tmpfs /tmp/asb-state --setenv XDG_STATE_HOME /tmp/asb-state)
+      SANDBOX_ARGV+=(--tmpfs /tmp/asb-cache --setenv XDG_CACHE_HOME /tmp/asb-cache)
       ;;
     vim|vi)
       if [ -e "$config_home/vim" ]; then add_ro_bind "$config_home/vim"; fi
@@ -361,15 +405,37 @@ build_sandbox() {
   local agent_dir t
   RO_BIND_SOURCES=()
 
-  SANDBOX_ARGV=(bwrap --die-with-parent
+  # Unshare the PID, IPC, and UTS namespaces. PID hides the host process
+  # table. IPC hides host System V IPC objects and POSIX message queues. UTS
+  # isolates the hostname and domainname, so a sandboxed process cannot rename
+  # the host. None of these change the sandbox's own view of its processes,
+  # IPC, or hostname, so ordinary tools keep working.
+  #
+  # Also disable further user namespaces: `--disable-userns` (which requires
+  # `--unshare-user`) caps `user.max_user_namespaces` in the sandbox's user
+  # namespace and enters a nested user namespace that cannot raise the limit.
+  # A sandboxed process therefore cannot create another user namespace to
+  # remount the filesystem or reach other namespace-based escape primitives.
+  # Nested bwrap, rootless containers, and tools that sandbox themselves with
+  # user namespaces stop working; everything else is unaffected.
+  SANDBOX_ARGV=(bwrap --die-with-parent --unshare-user --disable-userns
+    --unshare-pid --unshare-ipc --unshare-uts
     --ro-bind /usr /usr
     --ro-bind /bin /bin
     --ro-bind /lib /lib
   )
   if [ -d /lib64 ]; then SANDBOX_ARGV+=(--ro-bind /lib64 /lib64); fi
-  SANDBOX_ARGV+=(--ro-bind /etc /etc)
-  if [ -d /run ]; then SANDBOX_ARGV+=(--ro-bind /run /run); fi
-  SANDBOX_ARGV+=(--dev /dev --proc /proc --bind /tmp /tmp)
+  bind_etc
+  # /run is deliberately not mounted. The host's runtime directory is a socket
+  # rendezvous: the session and system D-Bus, the keyring and gpg-agent,
+  # PipeWire/PulseAudio, and more. None of it is needed here. DNS does not need
+  # it either: bwrap resolves the /etc/resolv.conf symlink (to
+  # /run/systemd/resolve/resolv.conf on systemd hosts) and binds the target's
+  # contents, so the resolver configuration is mounted by content in bind_etc.
+  #
+  # /tmp is a private tmpfs, so every execution starts with an empty temp
+  # directory and cannot see (or connect to sockets in) the host's /tmp.
+  SANDBOX_ARGV+=(--dev /dev --proc /proc --tmpfs /tmp)
 
   # The Target directory is the single writable work area.
   SANDBOX_ARGV+=(--bind "$TARGET_DIR" "$TARGET_DIR")
@@ -412,7 +478,17 @@ build_sandbox() {
     agent_headless_env
   fi
 
+  # Drop the tmux rendezvous variables. The socket may live in the host's /tmp
+  # (now hidden) or in a TMUX_TMPDIR that happens to be mounted; without both
+  # variables a sandboxed tmux starts its own server in the private /tmp.
+  #
+  # Drop the D-Bus rendezvous too. DBUS_SESSION_BUS_ADDRESS names a socket under
+  # the host's /run/user tree (not mounted, above), and XDG_RUNTIME_DIR locates
+  # that tree; removing both keeps a sandboxed process from even trying to reach
+  # the host's session bus or user services.
   SANDBOX_ARGV+=(--chdir "$TARGET_DIR" --setenv HOME "$HOME" --setenv GIT_OPTIONAL_LOCKS 0)
+  SANDBOX_ARGV+=(--unsetenv TMUX --unsetenv TMUX_TMPDIR)
+  SANDBOX_ARGV+=(--unsetenv DBUS_SESSION_BUS_ADDRESS --unsetenv XDG_RUNTIME_DIR)
   SANDBOX_ARGV+=(--)
   SANDBOX_ARGV+=("$@")
 }

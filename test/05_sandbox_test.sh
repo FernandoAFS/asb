@@ -6,7 +6,54 @@ t_target_and_tmp_writable() {
   mk_env
   out=$(run_kit . --dry-run)
   assert_contains "$out" "--bind $SB/proj $SB/proj"
-  assert_contains "$out" "--bind /tmp /tmp"
+  assert_contains "$out" "--tmpfs /tmp"
+  assert_not_contains "$out" "--bind /tmp /tmp"
+}
+
+t_process_and_ipc_namespaces_are_isolated() {
+  mk_env
+  out=$(run_kit . --dry-run)
+  assert_contains "$out" "--unshare-pid"
+  assert_contains "$out" "--unshare-ipc"
+  assert_contains "$out" "--unshare-uts"
+  assert_contains "$out" "--unshare-user --disable-userns"
+}
+
+t_tmux_socket_is_not_reachable() {
+  mk_env
+  export TMUX_TMPDIR="$SB/proj/tmux" TMUX="/tmp/tmux-1000/default,1,0"
+  out=$(run_kit . --dry-run)
+  assert_contains "$out" "--unsetenv TMUX"
+  assert_contains "$out" "--unsetenv TMUX_TMPDIR"
+  assert_contains "$out" "--tmpfs /tmp"
+}
+
+t_run_is_not_mounted() {
+  mk_env
+  out=$(run_kit . --dry-run)
+  assert_not_contains "$out" "--ro-bind /run /run"
+  assert_not_contains "$out" "/run/user"
+}
+
+t_dbus_rendezvous_is_dropped() {
+  mk_env
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/1000/bus"
+  export XDG_RUNTIME_DIR="/run/user/1000"
+  out=$(run_kit . --dry-run)
+  assert_contains "$out" "--unsetenv DBUS_SESSION_BUS_ADDRESS"
+  assert_contains "$out" "--unsetenv XDG_RUNTIME_DIR"
+}
+
+t_etc_is_allowlisted() {
+  mk_env
+  out=$(run_kit . --dry-run)
+  assert_not_contains "$out" "--ro-bind /etc /etc"
+  assert_contains "$out" "--ro-bind /etc/passwd /etc/passwd"
+  assert_contains "$out" "--ro-bind /etc/resolv.conf /etc/resolv.conf"
+  assert_contains "$out" "--ro-bind /etc/ssl/certs /etc/ssl/certs"
+  assert_not_contains "$out" "/etc/shadow"
+  assert_not_contains "$out" "/etc/ssh"
+  assert_not_contains "$out" "/etc/machine-id"
 }
 
 t_git_readonly_by_default() {
@@ -144,7 +191,7 @@ t_no_bind_without_user_skills() {
   assert_not_contains "$out" "$HOME/.agents"
 }
 
-t_nvim_state_is_a_private_tmpfs() {
+t_nvim_state_and_cache_are_private_tmpfs() {
   mk_env
   export EDITOR=nvim
   mkdir -p "$HOME/.config/nvim" "$HOME/.local/share/nvim" \
@@ -152,9 +199,10 @@ t_nvim_state_is_a_private_tmpfs() {
   out=$(run_kit . --dry-run)
   assert_contains "$out" "--ro-bind $HOME/.config/nvim $HOME/.config/nvim"
   assert_contains "$out" "--ro-bind $HOME/.local/share/nvim $HOME/.local/share/nvim"
-  assert_contains "$out" "--ro-bind $HOME/.cache/nvim $HOME/.cache/nvim"
   assert_contains "$out" "--tmpfs /tmp/asb-state --setenv XDG_STATE_HOME /tmp/asb-state"
+  assert_contains "$out" "--tmpfs /tmp/asb-cache --setenv XDG_CACHE_HOME /tmp/asb-cache"
   assert_not_contains "$out" "$HOME/.local/state/nvim"
+  assert_not_contains "$out" "$HOME/.cache/nvim"
   assert_not_contains "$out" "--bind $HOME/.config/nvim $HOME/.config/nvim"
 }
 
@@ -169,8 +217,9 @@ t_nvim_dirs_follow_xdg() {
   assert_contains "$out" "--ro-bind $XDG_CONFIG_HOME/nvim $XDG_CONFIG_HOME/nvim"
   assert_contains "$out" "--ro-bind $XDG_DATA_HOME/nvim $XDG_DATA_HOME/nvim"
   assert_contains "$out" "--tmpfs /tmp/asb-state --setenv XDG_STATE_HOME /tmp/asb-state"
+  assert_contains "$out" "--tmpfs /tmp/asb-cache --setenv XDG_CACHE_HOME /tmp/asb-cache"
   assert_not_contains "$out" "$XDG_STATE_HOME/nvim"
-  assert_contains "$out" "--ro-bind $XDG_CACHE_HOME/nvim $XDG_CACHE_HOME/nvim"
+  assert_not_contains "$out" "$XDG_CACHE_HOME/nvim"
 }
 
 t_vim_dirs_readonly_when_editor_is_vim() {
@@ -212,6 +261,11 @@ t_no_editor_mounts_when_dirs_absent() {
 }
 
 run_test "the Target is writable and /tmp is a private tmpfs" t_target_and_tmp_writable
+run_test "the process table and IPC/UTS namespaces are isolated" t_process_and_ipc_namespaces_are_isolated
+run_test "the tmux socket is unreachable" t_tmux_socket_is_not_reachable
+run_test "/run is not mounted" t_run_is_not_mounted
+run_test "the D-Bus rendezvous is dropped" t_dbus_rendezvous_is_dropped
+run_test "/etc is a read-only allowlist, not a wholesale mount" t_etc_is_allowlisted
 run_test "git state is read-only by default" t_git_readonly_by_default
 run_test "--allow-git-write makes git writable" t_git_writable_with_flag
 run_test "a directory outside a repo adds no git binds" t_no_git_bind_outside_a_repo
@@ -229,7 +283,7 @@ run_test "provider credentials are mounted read-only" t_provider_credentials_rea
 run_test "kit config follows XDG_CONFIG_HOME" t_config_follows_xdg_config_home
 run_test "user skills are mounted read-only" t_user_skills_readonly
 run_test "user skills are not mounted when absent" t_no_bind_without_user_skills
-run_test "nvim config/data/cache are read-only and state is a private tmpfs" t_nvim_state_is_a_private_tmpfs
+run_test "nvim config/data are read-only and state/cache are private tmpfs" t_nvim_state_and_cache_are_private_tmpfs
 run_test "nvim dirs follow XDG base directories" t_nvim_dirs_follow_xdg
 run_test "vim dirs are mounted read-only when EDITOR is vim" t_vim_dirs_readonly_when_editor_is_vim
 run_test "the editor program is read from a path with arguments" t_editor_program_read_from_path_with_args

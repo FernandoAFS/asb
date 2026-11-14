@@ -1,4 +1,4 @@
-# nvim state is a private tmpfs, not a host mount
+# nvim state and cache are private tmpfs, not host mounts
 
 ## Status
 
@@ -20,24 +20,36 @@ starting. A read-only bind has the same leak, and a copy-on-write overlay does
 too: the overlay's lower layer is the host state directory, so the undo history
 is still readable inside the sandbox.
 
+nvim also writes to `XDG_CACHE_HOME` (`~/.cache/nvim`): compiled Lua bytecode
+under `luac/`, plugin caches, and logs. A read-only host cache mount fails at
+startup with `EROFS` when the loader tries to write a `.luac` file. The cache is
+derived data, so it does not need to come from the host.
+
 ## Decision
 
-Do not mount the host's nvim state directory at all.
+Do not mount the host's nvim state or cache directories at all.
 
-- Mount nvim's config, data, and cache directories read-only, as before, because
-  nvim needs the developer's configuration and installed plugins.
+- Mount nvim's config and data directories read-only, because nvim needs the
+  developer's configuration and installed plugins.
 - Mount a private tmpfs at `/tmp/asb-state` and set `XDG_STATE_HOME` to it.
   nvim creates `$XDG_STATE_HOME/nvim` afresh, so undo, shada, and swap start
   empty and every write stays in the sandbox.
+- Mount a private tmpfs at `/tmp/asb-cache` and set `XDG_CACHE_HOME` to it.
+  nvim creates `$XDG_CACHE_HOME/nvim` afresh, so compiled bytecode and plugin
+  caches start empty and every write stays in the sandbox.
 
 ## Consequences
 
 - No undo history, shada, or swap from a previous session is reachable. The
   sandboxed session starts with a clean history.
-- Nvim still starts and writes its state, because it has a writable state
-  directory; nothing reaches the host.
+- Nvim still starts and writes its state and cache, because both have writable
+  directories; nothing reaches the host.
 - Undo history and command history do not persist across sandboxed sessions.
   That matches the ephemeral-session policy of ADR-0002.
+- Compiled Lua bytecode and plugin caches are rebuilt in each session. Startup
+  may be slightly slower the first time, but no host cache is read or written.
+- Other tools inherit `XDG_CACHE_HOME=/tmp/asb-cache` too: their caches are
+  ephemeral and not the host's.
 - The tmpfs is private to each sandbox's mount namespace, so concurrent
   sessions do not share it even though the path is fixed.
 - Other tools inherit `XDG_STATE_HOME=/tmp/asb-state` for the same reason: their
@@ -53,6 +65,9 @@ Do not mount the host's nvim state directory at all.
   lower layer is still the host state, so the undo history remains readable.
 - **Point only `undodir` at a tmp path.** Rejected: shada and swap would still
   come from the host. Redirecting `XDG_STATE_HOME` covers all of them.
+- **Mount the host cache read-only.** Rejected: nvim writes compiled bytecode
+  there at startup and fails with `EROFS`. A copy-on-write overlay would avoid
+  the write failure but still expose host cache data as the lower layer.
 - **Point every XDG variable at tmp.** Rejected: nvim needs the host config and
   installed plugins from `XDG_CONFIG_HOME` and `XDG_DATA_HOME`. Those stay
   read-only host mounts.

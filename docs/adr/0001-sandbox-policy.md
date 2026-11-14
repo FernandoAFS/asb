@@ -3,8 +3,10 @@
 ## Status
 
 Accepted. Amended by ADR-0002 (kit's session store is no longer mounted, and
-sandboxed kit sessions are ephemeral) and ADR-0005 (nvim's state directory is a
-private tmpfs, not the host's).
+sandboxed kit sessions are ephemeral), ADR-0005 (nvim's state and cache
+directories are private tmpfs, not the host's), and ADR-0006 (private `/tmp`, an
+`/etc` allowlist, no `/run`, a PID namespace, and tmux and D-Bus variables
+dropped).
 
 ## Context
 
@@ -18,8 +20,8 @@ boundary.
 Every kit launch runs inside a single `bwrap` invocation that is default-deny on
 the filesystem. Only the Target directory, `/tmp`, and kit's session store are
 writable. Everything shared is read-only: the Project's git state, the system
-directories needed to run — including `/run`, so that DNS resolution through the
-`/etc/resolv.conf` symlink keeps working — the kit binary's directory, and kit's
+directories needed to run (excluding `/run`, which ADR-0006 removes), the kit
+binary's directory, and kit's
 config are mounted read-only. Every directory on `PATH` is mounted read-only as
 well, so a sandboxed session can run the same tools the host can even when they
 are installed outside the system directories (`uvx`, cargo, pnpm and the like); a
@@ -31,12 +33,13 @@ defaults to `~/.config`, so the mount follows the environment kit itself reads.
 The user's agent skills in `~/.agents` are mounted read-only when present, so
 the session can load them but cannot rewrite its own instructions. When the
 developer's `$EDITOR` is vim or nvim, that editor's configuration and runtime
-directories are also mounted — the `nvim` config, data, state, and cache
-directories under the XDG base directories for nvim, and `$XDG_CONFIG_HOME/vim`,
-`~/.vim`, and `~/.vimrc` for vim — so a session edits with the developer's setup
-and plugins but cannot rewrite them. nvim's state directory is the one
-exception: it is mounted writable, because nvim opens its log, shada, and undo
-files there at startup and a read-only state directory stops nvim from starting.
+directories are also mounted — the `nvim` config and data directories under the
+XDG base directories for nvim, and `$XDG_CONFIG_HOME/vim`, `~/.vim`, and
+`~/.vimrc` for vim — so a session edits with the developer's setup and plugins
+but cannot rewrite them. nvim's state and cache directories are not mounted:
+the sandbox points `XDG_STATE_HOME` and `XDG_CACHE_HOME` at private tmpfs
+directories, so undo history, shada, swap, and compiled bytecode stay out of
+reach and nvim still starts.
 Network is allowed, and the sandbox is `--die-with-parent`. The launch always
 passes `--no-daemon` so kit cannot hand the session to a host daemon that would
 run outside the sandbox.

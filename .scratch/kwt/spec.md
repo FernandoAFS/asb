@@ -14,10 +14,11 @@ while everything else on the machine stays out of reach.
 ## Solution
 
 A single `asb` command that runs an agent inside a default-deny `bwrap` sandbox
-rooted at a directory. Only that directory and `/tmp` are writable. The
-Project's git state, the host's tools, the agent's configuration, and the user's
-agent skills are mounted read-only. The agent is chosen explicitly: `asb kit` or
-`asb pig`. `asb --shell` runs a shell under the same policy for debugging.
+rooted at a directory. Only that directory is persistently writable; `/tmp` is a
+private tmpfs recreated for each execution. The Project's git state, the host's
+tools, the agent's configuration, and the user's agent skills are mounted
+read-only. The agent is chosen explicitly: `asb kit` or `asb pig`. `asb --shell`
+runs a shell under the same policy for debugging.
 
 ## Command surface
 
@@ -68,17 +69,26 @@ agent fails with a message that one is required.
 
 A single `bwrap` invocation per launched process, default-deny:
 
-- **Writable:** the Target directory and `/tmp`.
+- **Writable:** the Target directory persistently, and `/tmp` as a private
+  tmpfs that exists only for the lifetime of that Sandbox. The host's `/tmp`
+  (and anything in it, such as sockets) is not mounted.
 - **Read-only:** the Project's git state when the Target directory is a git
   checkout root (the git dir and common dir when they differ), the system
-  directories needed to run (`/usr`, `/bin`, `/lib`,
-  `/lib64`, `/etc`, `/run`), every directory on `PATH` (so tools installed
-  outside the system directories, such as `uvx`, are available; a tool that is
-  itself a symlink has its real target mounted too), the directory containing
-  the agent binary, kit's configuration (the pig profile overlays its
-  configuration instead, see Profiles), and the user's agent skills
-  (`~/.agents`, when present) so a session can read them but cannot rewrite its
-  own instructions. `XDG_CONFIG_HOME` defaults to `~/.config`.
+  directories needed to run (`/usr`, `/bin`, `/lib`, `/lib64`), an
+  allowlist of `/etc` entries (dynamic linking, account lookup, DNS, TLS trust,
+  time/locale, shell startup, and small data files such as `mime.types`), every
+  directory on `PATH` (so tools installed outside the system directories, such
+  as `uvx`, are available; a tool that is itself a symlink has its real target
+  mounted too), the directory containing the agent binary, kit's configuration
+  (the pig profile overlays its configuration instead, see Profiles), and the
+  user's agent skills (`~/.agents`, when present) so a session can read them but
+  cannot rewrite its own instructions. `XDG_CONFIG_HOME` defaults to
+  `~/.config`. `/etc` is never mounted wholesale: entries such as `shadow`,
+  `ssh` host keys, and `machine-id` stay absent. The host's `/run` is not
+  mounted either: it holds the session and system D-Bus sockets, the keyring
+  and gpg-agent, and other user-service sockets. DNS does not need it, because
+  bwrap resolves the `/etc/resolv.conf` symlink and binds the target's
+  contents.
 - **Configuration writes:** kit's configuration is read-only. Pig's
   configuration is a copy-on-write overlay: reads come from the host, writes go
   to an invisible tmpfs, and the host tree is never modified. Pig needs this
@@ -86,18 +96,35 @@ A single `bwrap` invocation per launched process, default-deny:
   so a read-only bind fails with `EROFS`.
 - **Editor setup:** when `$EDITOR` is vim or nvim, that editor's configuration
   and runtime directories are mounted, so a sandboxed session edits with the
-  developer's setup and plugins. For `nvim` these are the `nvim` config, data,
-  and cache directories under `$XDG_CONFIG_HOME`, `$XDG_DATA_HOME`, and
-  `$XDG_CACHE_HOME` (each defaulting to its usual `~/.config`, `~/.local/share`,
-  `~/.cache`), all read-only. nvim's state directory is not mounted: the
-  sandbox mounts a private tmpfs at `/tmp/asb-state` and sets
-  `XDG_STATE_HOME` to it, so nvim starts with no undo history, shada, or swap
-  and writes nothing back. The tmpfs is private to the sandbox's mount
-  namespace, so concurrent sessions do not share it. For `vim` (or `vi`) these are
-  `$XDG_CONFIG_HOME/vim`, `~/.vim`, and `~/.vimrc`, all read-only. Only
-  directories that exist are mounted.
+  developer's setup and plugins. For `nvim` these are the `nvim` config and
+  data directories under `$XDG_CONFIG_HOME` and `$XDG_DATA_HOME` (defaulting to
+  `~/.config` and `~/.local/share`), read-only. nvim's state and cache
+  directories are not mounted: the sandbox mounts private tmpfs directories at
+  `/tmp/asb-state` and `/tmp/asb-cache` and sets `XDG_STATE_HOME` and
+  `XDG_CACHE_HOME` to them. nvim starts with no undo history, shada, or swap
+  and writes no compiled Lua bytecode or plugin cache back to the host. The
+  cache must be writable because nvim compiles Lua bytecode there at startup;
+  a read-only host cache fails with `EROFS`. The tmpfs mounts are private to the
+  sandbox's mount namespace, so concurrent sessions do not share them. For
+  `vim` (or `vi`) these are `$XDG_CONFIG_HOME/vim`, `~/.vim`, and `~/.vimrc`,
+  all read-only. Only directories that exist are mounted.
 - **Network:** allowed (no network namespace isolation).
-- The sandbox is `--die-with-parent`.
+- **Processes and IPC:** the sandbox has private PID, IPC, and UTS namespaces
+  (`--unshare-pid`, `--unshare-ipc`, `--unshare-uts`). `/proc` lists only
+  processes inside the Sandbox, not the host's process table; host System V IPC
+  objects and POSIX message queues are not reachable; and the sandbox cannot
+  rename the host. Nested user namespaces are disabled (`--unshare-user
+  --disable-userns`), so a sandboxed process cannot create a new user namespace
+  to remount the filesystem or reach namespace-based escape primitives. The
+  sandbox is `--die-with-parent`.
+- **tmux:** `TMUX` and `TMUX_TMPDIR` are removed from the environment, and the
+  host's `/tmp` is not mounted, so a sandboxed process cannot attach to a host
+  tmux server. A sandboxed tmux starts its own server inside the private
+  `/tmp`.
+- **D-Bus:** `/run` is not mounted, so no host bus socket is reachable, and
+  `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR` are removed from the
+  environment, so a sandboxed process does not even try the host's session bus
+  or runtime tree.
 - `--allow-git-write` makes the git state writable instead of read-only.
 - The sandboxed kit launch always passes `--no-daemon`, so kit never hands the
   session to the host daemon (which would run kit outside the sandbox).
@@ -136,12 +163,24 @@ A single `bwrap` invocation per launched process, default-deny:
 
 ## Invariants
 
-- The Target directory is the only persistently writable source tree. A pig
+- The Target directory is the only persistently writable source tree. `/tmp`
+  is a private tmpfs whose contents are discarded when the sandbox exits. A pig
   configuration overlay is ephemeral: its writes go to an invisible tmpfs and
   are discarded when the sandbox exits.
-- nvim's state directory is not mounted. `XDG_STATE_HOME` points at a private
-  tmpfs, so undo history, shada, and swap from the host are not reachable and
-  nothing nvim writes reaches the host.
+- `/etc` is an allowlist of read-only entries; the rest of the host's system
+  configuration is absent.
+- The sandboxed process sees only its own PID, IPC, and UTS namespaces; host
+  process metadata, IPC objects, and hostname changes are not reachable.
+- A sandboxed process cannot create a new user namespace, so nested bwrap and
+  rootless containers do not work inside the Sandbox.
+- The tmux rendezvous environment is absent and the host's `/tmp` is not
+  mounted, so no host tmux socket is reachable.
+- The host's `/run` is not mounted and the D-Bus rendezvous environment is
+  absent, so no host D-Bus or user-service socket is reachable.
+- nvim's state and cache directories are not mounted. `XDG_STATE_HOME` and
+  `XDG_CACHE_HOME` point at private tmpfs directories, so undo history, shada,
+  swap, and cached bytecode from the host are not reachable and nothing nvim
+  writes reaches the host.
 - Git state is read-only unless `--allow-git-write`.
 - The agent is always explicit; there is no agent-less sandbox.
 - Sandboxed kit launches are always `--no-daemon`.
@@ -196,5 +235,13 @@ A single `bwrap` invocation per launched process, default-deny:
   supports `--no-daemon` and `kit session {ls,attach,kill,rename}`, while the
   clone under the developer's foss directory does not. The implementation should
   target the **installed binary's** interface.
+- `/etc` cannot be removed entirely without breaking basic runtime needs: the
+  dynamic linker, account lookup, DNS resolution, and TLS trust all read from
+  it. The sandbox therefore mounts an explicit allowlist and leaves everything
+  else absent.
+- `--unshare-pid` hides the host process table from the sandbox. It does not
+  hide the sandbox from the host: a same-user process outside the sandbox can
+  still inspect the sandboxed processes. Hiding process metadata from the host
+  would need a different isolation model and is not a goal of `asb`.
 - The bwrap policy is deliberately conservative; the proxy and a per-repo config
   file are the natural next features once this lands.
