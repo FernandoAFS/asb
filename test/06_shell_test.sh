@@ -1,52 +1,52 @@
 #!/usr/bin/env bash
-# 06: kwt shell <branch>.
+# 06: kwt shell <dir>.
 . "$(dirname "$0")/lib.sh"
 
-t_shell_opens_unsandboxed_window() {
+t_shell_runs_a_sandboxed_shell() {
   mk_env
-  run_kwt feature/one >/dev/null
   : >"$SHIM_LOG"
-  run_kwt shell feature/one >/dev/null
-  assert_log_contains "new-window -t proj -n feature-one~ -c $SB/proj/.worktrees/feature-one"
-  assert_log_not_contains "bwrap"
-}
-
-t_shell_requires_existing_worktree() {
-  mk_env
-  if out=$(run_kwt shell feature/one 2>&1); then fail "expected failure"; fi
-  assert_contains "$out" "no Worktree for 'feature/one'"
-  assert_contains "$out" "kwt feature/one"
-}
-
-t_shell_create_creates_worktree() {
-  mk_env
-  run_kwt shell feature/one --create >/dev/null
-  assert_dir "$SB/proj/.worktrees/feature-one"
-}
-
-t_shell_sandboxed_uses_policy() {
-  mk_env
-  run_kwt feature/one >/dev/null
-  : >"$SHIM_LOG"
-  run_kwt shell feature/one --sandboxed >/dev/null
+  run_kwt shell . >/dev/null
   assert_log_contains "bwrap"
-  assert_log_contains "--ro-bind $SB/proj/.git $SB/proj/.git"
-  assert_log_contains "--chdir $SB/proj/.worktrees/feature-one"
+  assert_log_contains "--chdir $SB/proj"
+  assert_log_contains "/bin/bash"
   assert_log_not_contains "kit --no-daemon"
 }
 
-t_shell_window_is_not_a_kit_session() {
+t_shell_is_not_headless() {
   mk_env
-  run_kwt feature/one >/dev/null
-  kill_window feature-one
-  run_kwt shell feature/one >/dev/null
-  assert_contains "$(run_kwt ls)" "stopped feature-one"
+  out=$(run_kwt shell . --dry-run)
+  assert_not_contains "$out" "KIT_OPT_HEADLESS"
 }
 
-run_test "kwt shell opens an unsandboxed shell window in the Worktree" t_shell_opens_unsandboxed_window
-run_test "without --create a missing Worktree is a clear error" t_shell_requires_existing_worktree
-run_test "with --create a missing Worktree is created first" t_shell_create_creates_worktree
-run_test "--sandboxed runs the shell under the sandbox policy" t_shell_sandboxed_uses_policy
-run_test "the shell window is not a kit session" t_shell_window_is_not_a_kit_session
+t_shell_git_readonly_by_default() {
+  mk_env
+  out=$(run_kwt shell . --dry-run)
+  assert_contains "$out" "--ro-bind $SB/proj/.git $SB/proj/.git"
+}
+
+t_shell_allow_git_write() {
+  mk_env
+  out=$(run_kwt shell . --allow-git-write --dry-run)
+  assert_contains "$out" "--bind $SB/proj/.git $SB/proj/.git"
+}
+
+t_shell_missing_dir_fails() {
+  mk_env
+  if out=$(run_kwt shell nope --dry-run 2>&1); then fail "expected failure"; fi
+  assert_contains "$out" "not a directory"
+}
+
+t_shell_bare_invocation_defaults_to_current_dir() {
+  mk_env
+  out=$(run_kwt shell --dry-run)
+  assert_contains "$out" "dir $SB/proj"
+}
+
+run_test "kwt shell runs a sandboxed shell in the Target directory" t_shell_runs_a_sandboxed_shell
+run_test "kwt shell defaults to the current directory" t_shell_bare_invocation_defaults_to_current_dir
+run_test "the shell window is not a kit session" t_shell_is_not_headless
+run_test "the shell keeps git read-only by default" t_shell_git_readonly_by_default
+run_test "--allow-git-write applies to the shell" t_shell_allow_git_write
+run_test "a missing directory fails clearly" t_shell_missing_dir_fails
 
 finish

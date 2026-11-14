@@ -3,8 +3,8 @@
 #
 # Tests drive the kwt executable as a subprocess and assert only on externally
 # observable results: the printed plan, filesystem state, and the recorded argv
-# of external tools. tmux, bwrap, and kit are replaced by PATH shims; git runs
-# for real inside throwaway repositories.
+# of external tools. bwrap and kit are replaced by PATH shims; git runs for
+# real inside throwaway repositories.
 set -u
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -58,23 +58,23 @@ assert_no_file() { [ ! -e "$1" ] || fail "unexpected file: $1"; }
 assert_dir() { [ -d "$1" ] || fail "expected dir: $1"; }
 assert_symlink() { [ -L "$1" ] || fail "expected symlink: $1"; }
 assert_success() { "$@" || fail "expected success: $*"; }
-assert_failure() { if "$@"; then fail "expected failure: $*"; fi; }
+assert_failure() { if "$@"; then fail "expected failure: $*"; fi }
 
 assert_log_contains() { assert_contains "$(cat "$SHIM_LOG" 2>/dev/null || true)" "$1"; }
 assert_log_not_contains() { assert_not_contains "$(cat "$SHIM_LOG" 2>/dev/null || true)" "$1"; }
 
-# Create an isolated sandbox: a temporary HOME, a shim PATH, a project git
-# repository, and tmux state. Leaves the shell cd'd into the project.
+# Create an isolated sandbox: a temporary HOME, a shim PATH, and a project git
+# repository. Leaves the shell cd'd into the project.
 mk_env() {
   SB=$(mktemp -d)
-  mkdir -p "$SB/home/.kit" "$SB/home/.config/kit" "$SB/tmux/sessions"
+  mkdir -p "$SB/home/.config/kit"
   export SB
   export HOME="$SB/home"
   export SHIM_LOG="$SB/log"
-  export TMUX_STATE="$SB/tmux"
+  export SHELL=/bin/bash
   : >"$SHIM_LOG"
   export PATH="$SHIMDIR:$PATH"
-  unset TMUX 2>/dev/null || true
+  unset EDITOR VISUAL 2>/dev/null || true
   mkdir -p "$SB/proj"
   (
     cd "$SB/proj" || exit 1
@@ -92,22 +92,4 @@ project_commit() {
   git -C "$SB/proj" commit -q -m "${1:-commit}"
 }
 
-# Make tmux report that the client is inside a session.
-inside_tmux_as() {
-  export TMUX=/tmp/fake-tmux
-  printf '%s' "$1" >"$TMUX_STATE/current"
-}
-
 run_kwt() { "$KW" "$@"; }
-
-# A Main checkout that looks Python with a .venv to link.
-make_python_project() {
-  echo 'print(1)' >pyproject.toml
-  mkdir -p .venv
-  echo v >.venv/marker
-}
-
-# Kill the kit window named after a Slug in the project's tmux session.
-kill_window() {
-  tmux kill-window -t "proj:$1" >/dev/null 2>&1 || true
-}

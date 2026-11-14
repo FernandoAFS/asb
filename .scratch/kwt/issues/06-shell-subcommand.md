@@ -1,17 +1,16 @@
-# 06: `kwt shell <branch>`
+# 06: `kwt shell <dir>`
 
-**What to build:** `kwt shell <branch>` opens an unsandboxed host shell window named `<slug>~` in the Worktree, for the operations the sandbox denies — dependency installs, commits, and pushes. It requires an existing Worktree unless `--create` is passed, and `--sandboxed` runs the same shell under the sandbox policy instead. The shell window is not a kit session and does not count against the one-kit-session-per-Worktree invariant.
+**What to build:** `kwt shell <dir>` runs a shell under the same sandbox policy as a kit launch: the Target directory writable, git read-only by default, and `--allow-git-write` available to open git. It is not a kit session and does not set headless mode.
 
-**Blocked by:** 04 — Open a tmux window per Worktree and launch kit; 05 — Run the kit launch inside the bwrap sandbox
+**Blocked by:** 05 — Run the kit launch inside the bwrap sandbox
 
 **Status:** ready-for-agent
 
-- [ ] `kwt shell <branch>` opens a shell window named `<slug>~` in the Worktree.
-- [ ] The shell is unsandboxed by default and can install dependencies, commit, and push.
-- [ ] Without `--create`, a missing Worktree produces a clear error pointing to `kwt <branch>`.
-- [ ] With `--create`, a missing Worktree is created first.
-- [ ] `--sandboxed` runs the shell under the sandbox policy (git read-only).
-- [ ] The shell window is not treated as a kit session.
+- [ ] `kwt shell <dir>` runs a sandboxed shell in the Target directory.
+- [ ] The shell runs with the Target directory as its working directory.
+- [ ] The shell is not headless.
+- [ ] `--allow-git-write` applies to the shell.
+- [ ] A missing directory fails with a clear error.
 
 ## Comments
 

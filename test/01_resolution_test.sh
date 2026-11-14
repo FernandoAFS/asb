@@ -1,89 +1,84 @@
 #!/usr/bin/env bash
-# 01: Foundation — CLI, Project resolution, and the --dry-run plan.
+# 01: Foundation — directory resolution and the --dry-run plan.
 . "$(dirname "$0")/lib.sh"
 
-t_dry_run_from_root() {
+t_dry_run_prints_the_resolved_dir() {
   mk_env
-  echo 'print(1)' >pyproject.toml
-  out=$(run_kwt feature/one --dry-run)
-  assert_contains "$out" "worktree $SB/proj/.worktrees/feature-one"
-  assert_contains "$out" "branch feature/one"
-  assert_contains "$out" "base $(git rev-parse HEAD)"
-  assert_contains "$out" "session proj"
-  assert_contains "$out" "window feature-one"
+  out=$(run_kwt . --dry-run)
+  assert_contains "$out" "dir $SB/proj"
 }
 
-t_dry_run_from_subdir() {
+t_relative_dir_resolves_to_absolute() {
   mk_env
-  mkdir -p a/b/c
-  out=$(cd a/b/c && run_kwt feature/one --dry-run)
-  assert_contains "$out" "worktree $SB/proj/.worktrees/feature-one"
-  assert_contains "$out" "session proj"
+  mkdir -p sub
+  out=$(cd sub && run_kwt .. --dry-run)
+  assert_contains "$out" "dir $SB/proj"
 }
 
-t_dry_run_inside_worktree_yields_main() {
+t_dry_run_from_subdir_targets_the_subdir() {
   mk_env
-  git worktree add -q .worktrees/existing -b existing
-  out=$(cd .worktrees/existing && run_kwt feature/two --dry-run)
-  assert_contains "$out" "worktree $SB/proj/.worktrees/feature-two"
-  assert_contains "$out" "session proj"
-  assert_not_contains "$out" ".worktrees/existing/.worktrees"
+  mkdir -p a/b
+  out=$(run_kwt a/b --dry-run)
+  assert_contains "$out" "dir $SB/proj/a/b"
 }
 
 t_dry_run_performs_no_side_effects() {
   mk_env
-  echo 'print(1)' >pyproject.toml
-  run_kwt feature/one --dry-run >/dev/null
-  assert_no_file "$SB/proj/.worktrees"
-  assert_log_not_contains "tmux"
+  run_kwt . --dry-run >/dev/null
   assert_log_not_contains "bwrap"
   assert_log_not_contains "kit"
-  assert_not_contains "$(cat "$SB/proj/.git/info/exclude" 2>/dev/null || true)" ".worktrees"
+  assert_eq "$(git -C "$SB/proj" status --porcelain)" ""
 }
 
-t_outside_git_repo_fails() {
+t_missing_dir_fails() {
   mk_env
-  mkdir -p "$SB/notgit"
-  if out=$(cd "$SB/notgit" && run_kwt feature/one --dry-run 2>&1); then
-    fail "expected a non-zero exit outside a git repository"
-  fi
-  assert_contains "$out" "not inside a git repository"
+  if out=$(run_kwt nope --dry-run 2>&1); then fail "expected failure"; fi
+  assert_contains "$out" "not a directory"
 }
 
-t_bare_invocation_is_not_a_command() {
+t_root_dir_refused() {
   mk_env
-  if run_kwt >/dev/null 2>&1; then fail "bare kwt should fail"; fi
+  if out=$(run_kwt / --dry-run 2>&1); then fail "expected failure"; fi
+  assert_contains "$out" "refusing to sandbox the filesystem root"
+}
+
+t_bare_invocation_defaults_to_current_dir() {
+  mk_env
+  out=$(run_kwt --dry-run)
+  assert_contains "$out" "dir $SB/proj"
+}
+
+t_bare_invocation_runs_kit() {
+  mk_env
+  : >"$SHIM_LOG"
+  run_kwt >/dev/null
+  assert_log_contains "bwrap"
+  assert_log_contains "kit --no-daemon --no-session"
 }
 
 t_argument_parsing() {
   mk_env
-  base=$(git rev-parse HEAD)
-  out=$(run_kwt b1 --base "$base" --detached --allow-git-write --dry-run)
-  assert_contains "$out" "branch b1"
-  assert_contains "$out" "base $base"
-  assert_contains "$out" "attach proj"
+  out=$(run_kwt . --allow-git-write --dry-run)
   assert_contains "$out" "--bind $SB/proj/.git $SB/proj/.git"
 
-  out=$(run_kwt b2 -b "$base" -d --dry-run)
-  assert_contains "$out" "base $base"
-  assert_contains "$out" "attach proj"
-
-  out=$(run_kwt b3 --dry-run -- "hello world")
-  assert_contains "$out" "kit --no-daemon hello\\ world"
+  out=$(run_kwt . --dry-run -- "hello world")
+  assert_contains "$out" "kit --no-daemon --no-session hello\\ world"
 }
 
 t_unknown_option_fails() {
   mk_env
-  if out=$(run_kwt feature/one --nope 2>&1); then fail "expected failure"; fi
+  if out=$(run_kwt . --nope 2>&1); then fail "expected failure"; fi
   assert_contains "$out" "unknown option"
 }
 
-run_test "dry-run prints the resolved plan" t_dry_run_from_root
-run_test "resolution works from a subdirectory" t_dry_run_from_subdir
-run_test "resolution inside a Worktree yields the Main checkout" t_dry_run_inside_worktree_yields_main
+run_test "dry-run prints the resolved directory" t_dry_run_prints_the_resolved_dir
+run_test "a relative directory resolves to an absolute path" t_relative_dir_resolves_to_absolute
+run_test "a subdirectory target is resolved as given" t_dry_run_from_subdir_targets_the_subdir
 run_test "dry-run performs no side effects" t_dry_run_performs_no_side_effects
-run_test "running outside a git repository fails clearly" t_outside_git_repo_fails
-run_test "bare kwt is not a command" t_bare_invocation_is_not_a_command
+run_test "a missing directory fails clearly" t_missing_dir_fails
+run_test "the filesystem root is refused" t_root_dir_refused
+run_test "bare kwt defaults to the current directory" t_bare_invocation_defaults_to_current_dir
+run_test "bare kwt runs kit in the current directory" t_bare_invocation_runs_kit
 run_test "argument parsing accepts the documented flags" t_argument_parsing
 run_test "unknown options fail" t_unknown_option_fails
 

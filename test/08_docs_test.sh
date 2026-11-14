@@ -7,7 +7,7 @@ t_context_glossary() {
   local c
   c=$(cat "$ROOT/CONTEXT.md")
   local term
-  for term in Project "Main checkout" Worktree Slug "tmux session" "tmux window" "kit session"; do
+  for term in "Target directory" Sandbox "kit session" Project; do
     assert_contains "$c" "$term"
   done
 }
@@ -31,7 +31,7 @@ t_adr_records_sandbox_policy() {
   assert_contains "$c" "Alternatives"
 }
 
-run_test "CONTEXT.md defines the seven glossary terms" t_context_glossary
+run_test "CONTEXT.md defines the glossary terms" t_context_glossary
 run_test "CONTEXT.md is a glossary, not implementation detail" t_context_is_glossary_only
 run_test "the ADR records the sandbox policy and alternatives" t_adr_records_sandbox_policy
 

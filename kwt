@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #
-# kwt — kit worktree wrapper
+# kwt — run kit in a bwrap sandbox
 #
-# Creates or reuses a git Worktree for a branch, links the shared dependency
-# and env paths into it, opens a tmux window for it, and launches kit inside a
-# default-deny bwrap sandbox. See .scratch/kwt/spec.md for the specification.
+# Runs kit inside a default-deny bwrap sandbox rooted at a directory. The
+# directory is the only writable source tree; the Project's git state, the
+# host's tools, kit's configuration, and the user's agent skills are mounted
+# read-only. See .scratch/kwt/spec.md for the specification.
 #
 set -euo pipefail
 
@@ -13,206 +14,60 @@ PROG=kwt
 # ---------------------------------------------------------------------------
 # State populated by resolution and command parsing.
 # ---------------------------------------------------------------------------
-MAIN=""
-COMMON_DIR=""
-PROJECT=""
-BRANCH=""
-SLUG=""
-WT_PATH=""
-BASE=""
-WINDOW=""
-DETACHED=0
-DRY_RUN=0
+TARGET_DIR=""
+GIT_DIRS=()
 ALLOW_GIT_WRITE=0
+DRY_RUN=0
+HEADLESS=0
 PROMPT=()
-LINK_NAMES=()
-LINK_TARGETS=()
-SHARED_TARGETS=()
 SANDBOX_ARGV=()
+RO_BIND_SOURCES=()
 
 die() { printf '%s: error: %s\n' "$PROG" "$*" >&2; exit 1; }
 
 usage() {
   cat <<'EOF'
 usage:
-  kwt <branch> [--base <branch>] [-d|--detached] [--allow-git-write] [--dry-run] [-- <prompt>...]
-  kwt shell <branch> [--create] [--sandboxed] [--dry-run]
-  kwt ls
-  kwt rm [<branch>] [--force]
+  kwt [<dir>] [--allow-git-write] [--dry-run] [-- <prompt>...]
+  kwt shell [<dir>] [--allow-git-write] [--dry-run]
 
 options:
-  -b, --base <branch>   base for a new branch (default: current HEAD)
-  -d, --detached        create the Worktree and window without switching
       --allow-git-write make git state writable inside the sandbox
       --dry-run         print the plan and perform no side effects
   -h, --help            show this help
+
+<dir> defaults to the current directory.
 EOF
 }
 
 # ---------------------------------------------------------------------------
 # Resolution
 # ---------------------------------------------------------------------------
-# Resolve the Project from anywhere in a git repository, including from inside
-# a Worktree. The git common dir is `<main>/.git`, so its parent is the Main
-# checkout regardless of where the command was invoked.
-resolve_project() {
-  local common
-  if ! common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null); then
-    die "not inside a git repository"
-  fi
-  COMMON_DIR=$(cd "$common" && pwd -P)
-  MAIN=$(dirname "$COMMON_DIR")
-  PROJECT=$(basename "$MAIN")
-}
-
-slug_of() { printf '%s' "${1//\//-}"; }
-
-# The single Worktree path for a Slug.
-worktree_path() { printf '%s/.worktrees/%s' "$MAIN" "$1"; }
-
-main_is_python() {
-  local f
-  for f in pyproject.toml requirements.txt uv.lock poetry.lock setup.py; do
-    if [ -e "$MAIN/$f" ]; then return 0; fi
-  done
-  return 1
-}
-
-main_is_node() {
-  [ -e "$MAIN/package.json" ]
-}
-
-worktree_exists() {
-  [ -e "$WT_PATH/.git" ]
-}
-
-branch_exists() {
-  git -C "$MAIN" show-ref --verify --quiet "refs/heads/$BRANCH"
-}
-
-# ---------------------------------------------------------------------------
-# Links
-# ---------------------------------------------------------------------------
-# Emit `<name>\t<abs target>` for each shared path the Main checkout provides:
-# .venv when it looks Python, node_modules when it looks Node, .env always.
-candidate_targets() {
-  if main_is_python && [ -e "$MAIN/.venv" ]; then printf '.venv\t%s\n' "$MAIN/.venv"; fi
-  if main_is_node && [ -e "$MAIN/node_modules" ]; then printf 'node_modules\t%s\n' "$MAIN/node_modules"; fi
-  if [ -e "$MAIN/.env" ]; then printf '.env\t%s\n' "$MAIN/.env"; fi
-}
-
-# Links to create for a freshly created Worktree. A reused Worktree is never
-# changed, so nothing is listed for it.
-compute_links() {
-  LINK_NAMES=()
-  LINK_TARGETS=()
-  if worktree_exists; then return 0; fi
-  local name target
-  while IFS=$'\t' read -r name target; do
-    if [ ! -e "$WT_PATH/$name" ] && [ ! -L "$WT_PATH/$name" ]; then
-      LINK_NAMES+=("$name")
-      LINK_TARGETS+=("$target")
-    fi
-  done < <(candidate_targets)
-}
-
-create_links() {
-  local i name target
-  for i in "${!LINK_NAMES[@]}"; do
-    name=${LINK_NAMES[$i]}
-    target=${LINK_TARGETS[$i]}
-    if [ ! -e "$WT_PATH/$name" ] && [ ! -L "$WT_PATH/$name" ]; then
-      ln -s "$target" "$WT_PATH/$name"
-    fi
-  done
-}
-
-# Every shared path that must be bound read-only inside the sandbox: the
-# existing symlinks of a reused Worktree, plus the links a fresh Worktree will
-# receive.
-compute_shared_targets() {
-  SHARED_TARGETS=()
-  local name target
-  while IFS=$'\t' read -r name target; do
-    if [ -L "$WT_PATH/$name" ]; then
-      SHARED_TARGETS+=("$(readlink -f "$WT_PATH/$name")")
-    elif [ ! -e "$WT_PATH/$name" ]; then
-      SHARED_TARGETS+=("$target")
-    fi
-  done < <(candidate_targets)
-}
-
-# ---------------------------------------------------------------------------
-# Worktree creation
-# ---------------------------------------------------------------------------
-ensure_exclude() {
-  local exclude="$COMMON_DIR/info/exclude"
-  if [ ! -e "$exclude" ]; then
-    mkdir -p "$(dirname "$exclude")"
-    : >"$exclude"
-  fi
-  if ! grep -qxF '.worktrees' "$exclude"; then
-    printf '.worktrees\n' >>"$exclude"
+# Resolve the Target directory to an absolute path. The filesystem root is
+# refused: making it writable would defeat the sandbox.
+resolve_dir() {
+  local dir=$1
+  [ -d "$dir" ] || die "not a directory: $dir"
+  TARGET_DIR=$(cd "$dir" && pwd -P)
+  if [ "$TARGET_DIR" = "/" ]; then
+    die "refusing to sandbox the filesystem root"
   fi
 }
 
-ensure_worktree() {
-  if worktree_exists; then return 0; fi
-  ensure_exclude
-  if branch_exists; then
-    git -C "$MAIN" worktree add "$WT_PATH" "$BRANCH"
-  else
-    git -C "$MAIN" worktree add -b "$BRANCH" "$WT_PATH" "$BASE"
-  fi
-}
-
-# ---------------------------------------------------------------------------
-# tmux
-# ---------------------------------------------------------------------------
-tmux_has_session() { tmux has-session -t "$1" >/dev/null 2>&1; }
-tmux_has_window() {
-  tmux list-windows -t "$1" -F '#{window_name}' 2>/dev/null | grep -qxF "$2"
-}
-
-# Spawn the window if it is missing, then select or attach to it. Re-running
-# with the same window name never starts a second process.
-spawn_window() {
-  local session=$1 window=$2 cwd=$3 cmd=$4
-  local -a args
-  if tmux_has_session "$session"; then
-    if tmux_has_window "$session" "$window"; then
-      tmux_focus "$session" "$window"
-      return 0
-    fi
-    args=(new-window -t "$session" -n "$window")
-  else
-    args=(new-session -d -s "$session" -n "$window")
-  fi
-  if [ -n "$cwd" ]; then args+=(-c "$cwd"); fi
-  if [ -n "$cmd" ]; then args+=("$cmd"); fi
-  tmux "${args[@]}"
-  tmux_focus "$session" "$window"
-}
-
-tmux_focus() {
-  local session=$1 window=$2 cur
-  if [ "$DETACHED" = 1 ]; then
-    if [ -z "${TMUX:-}" ]; then
-      printf 'kwt: detached; attach with: tmux attach -t %s\n' "$session"
-    fi
-    return 0
-  fi
-  if [ -n "${TMUX:-}" ]; then
-    cur=$(tmux display-message -p '#S' 2>/dev/null || true)
-    if [ "$cur" != "$session" ]; then
-      tmux switch-client -t "$session"
-    fi
-    tmux select-window -t "$session:$window"
-  else
-    if tmux_has_session "$session"; then
-      tmux select-window -t "$session:$window" >/dev/null 2>&1 || true
-    fi
-    tmux attach -t "$session"
+# Absolute git directories for the Target directory. Empty when the Target is
+# not a git checkout root. Both the checkout's git dir and the common dir are
+# returned when they differ.
+resolve_git_dirs() {
+  GIT_DIRS=()
+  [ -e "$TARGET_DIR/.git" ] || return 0
+  local common gitdir
+  common=$(git -C "$TARGET_DIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 0
+  gitdir=$(git -C "$TARGET_DIR" rev-parse --path-format=absolute --git-dir 2>/dev/null) || gitdir=$common
+  common=$(cd "$common" 2>/dev/null && pwd -P) || return 0
+  GIT_DIRS+=("$common")
+  gitdir=$(cd "$gitdir" 2>/dev/null && pwd -P) || gitdir=""
+  if [ -n "$gitdir" ] && [ "$gitdir" != "$common" ]; then
+    GIT_DIRS+=("$gitdir")
   fi
 }
 
@@ -232,9 +87,99 @@ kit_binary() {
   printf '%s' "$KIT_BIN"
 }
 
+# Record a read-only bind unless an earlier mount already covers it. The
+# system directories are mounted wholesale, and a bind of a parent directory
+# already covers its children.
+ro_bind_covered() {
+  local path=$1 existing
+  case "$path" in
+    /usr|/usr/*|/bin|/bin/*|/lib|/lib/*|/lib64|/lib64/*|/etc|/etc/*|/run|/run/*) return 0 ;;
+  esac
+  for existing in ${RO_BIND_SOURCES[@]+"${RO_BIND_SOURCES[@]}"}; do
+    if [ "$path" = "$existing" ]; then return 0; fi
+    case "$path" in "$existing"/*) return 0 ;; esac
+  done
+  return 1
+}
+
+add_ro_bind() {
+  local path=$1
+  if ro_bind_covered "$path"; then return 0; fi
+  RO_BIND_SOURCES+=("$path")
+  SANDBOX_ARGV+=(--ro-bind "$path" "$path")
+}
+
+# Tools that live outside the system directories — `uvx`, cargo, pnpm and the
+# like — are reached through PATH. Mount each PATH directory read-only so a
+# sandboxed session can run them; a tool that is a symlink into another
+# directory also needs its real target mounted, or the link dangles.
+bind_path_tools() {
+  local dir resolved entry target s
+  local -a seen=()
+  while IFS= read -r dir; do
+    [ -n "$dir" ] || continue
+    [ -d "$dir" ] || continue
+    resolved=$(readlink -f "$dir") || continue
+    [ "$resolved" = "/" ] && continue
+    # The Target directory and /tmp are bound separately, and kit's session
+    # store is deliberately never mounted (sessions are ephemeral).
+    case "$resolved" in
+      "$TARGET_DIR"|"$TARGET_DIR"/*|/tmp|"$HOME/.kit"|"$HOME/.kit"/*) continue ;;
+    esac
+    for s in ${seen[@]+"${seen[@]}"}; do
+      [ "$resolved" = "$s" ] && continue 2
+    done
+    seen+=("$resolved")
+    if ro_bind_covered "$resolved"; then continue; fi
+    add_ro_bind "$resolved"
+    for entry in "$resolved"/*; do
+      [ -L "$entry" ] || continue
+      [ -x "$entry" ] || continue
+      target=$(readlink -f "$entry") || continue
+      add_ro_bind "$(dirname "$target")"
+    done
+  done < <(printf '%s\n' "${PATH:-}" | tr ':' '\n')
+}
+
+# The developer edits files inside kit with $EDITOR, which is vim or nvim. Mount
+# that editor's configuration, plugin, and runtime directories so a sandboxed
+# session has the developer's setup and plugins. Everything is read-only except
+# nvim's state directory, which nvim writes to at startup (its log, shada, and
+# undo files); a read-only state directory makes nvim fail to start. $EDITOR may
+# carry arguments (`nvim -f`) or a path; only the program name matters.
+# Directories that do not exist are skipped, so a bare editor install adds no
+# mounts.
+bind_editor_config() {
+  local editor=${EDITOR:-}
+  local config_home data_home state_home cache_home
+  editor=${editor%% *}
+  [ -n "$editor" ] || return 0
+  editor=$(basename "$editor")
+  config_home=${XDG_CONFIG_HOME:-$HOME/.config}
+  case "$editor" in
+    nvim)
+      data_home=${XDG_DATA_HOME:-$HOME/.local/share}
+      state_home=${XDG_STATE_HOME:-$HOME/.local/state}
+      cache_home=${XDG_CACHE_HOME:-$HOME/.cache}
+      if [ -e "$config_home/nvim" ]; then add_ro_bind "$config_home/nvim"; fi
+      if [ -e "$data_home/nvim" ]; then add_ro_bind "$data_home/nvim"; fi
+      if [ -e "$state_home/nvim" ]; then
+        SANDBOX_ARGV+=(--bind "$state_home/nvim" "$state_home/nvim")
+      fi
+      if [ -e "$cache_home/nvim" ]; then add_ro_bind "$cache_home/nvim"; fi
+      ;;
+    vim|vi)
+      if [ -e "$config_home/vim" ]; then add_ro_bind "$config_home/vim"; fi
+      if [ -e "$HOME/.vim" ]; then add_ro_bind "$HOME/.vim"; fi
+      if [ -e "$HOME/.vimrc" ]; then add_ro_bind "$HOME/.vimrc"; fi
+      ;;
+  esac
+}
+
 build_sandbox() {
-  local kit_dir t
+  local kit_dir t config_home
   kit_dir=$(dirname "$(kit_binary)")
+  RO_BIND_SOURCES=()
 
   SANDBOX_ARGV=(bwrap --die-with-parent
     --ro-bind /usr /usr
@@ -246,34 +191,63 @@ build_sandbox() {
   if [ -d /run ]; then SANDBOX_ARGV+=(--ro-bind /run /run); fi
   SANDBOX_ARGV+=(--dev /dev --proc /proc --bind /tmp /tmp)
 
-  # The Worktree is the single writable work area.
-  SANDBOX_ARGV+=(--bind "$WT_PATH" "$WT_PATH")
+  # The Target directory is the single writable work area.
+  SANDBOX_ARGV+=(--bind "$TARGET_DIR" "$TARGET_DIR")
 
   # Git state: read-only by default, writable only when explicitly allowed.
-  if [ "$ALLOW_GIT_WRITE" = 1 ]; then
-    SANDBOX_ARGV+=(--bind "$COMMON_DIR" "$COMMON_DIR")
-  else
-    SANDBOX_ARGV+=(--ro-bind "$COMMON_DIR" "$COMMON_DIR")
-  fi
-
-  # Shared dependency/env targets are always read-only.
-  for t in ${SHARED_TARGETS[@]+"${SHARED_TARGETS[@]}"}; do
-    SANDBOX_ARGV+=(--ro-bind "$t" "$t")
+  for t in ${GIT_DIRS[@]+"${GIT_DIRS[@]}"}; do
+    if [ "$ALLOW_GIT_WRITE" = 1 ]; then
+      SANDBOX_ARGV+=(--bind "$t" "$t")
+    else
+      SANDBOX_ARGV+=(--ro-bind "$t" "$t")
+    fi
   done
 
+  # Every tool directory on PATH, so sandboxed sessions can run the same
+  # commands the host can.
+  bind_path_tools
+
   # Everything needed to run: the kit binary's directory and kit's config.
-  SANDBOX_ARGV+=(--ro-bind "$kit_dir" "$kit_dir")
-  if [ -e "$HOME/.config/kit" ]; then
-    SANDBOX_ARGV+=(--ro-bind "$HOME/.config/kit" "$HOME/.config/kit")
+  # kit reads its config from $XDG_CONFIG_HOME (default ~/.config): the `kit`
+  # directory holds settings, and `.kit` holds provider credentials and MCP
+  # tokens. Both are mounted read-only so a sandboxed session can authenticate
+  # but cannot write secrets.
+  add_ro_bind "$kit_dir"
+  config_home=${XDG_CONFIG_HOME:-$HOME/.config}
+  if [ -e "$config_home/kit" ]; then
+    add_ro_bind "$config_home/kit"
+  fi
+  if [ -e "$config_home/.kit" ]; then
+    add_ro_bind "$config_home/.kit"
   fi
   if [ -e "$HOME/.kit.yml" ]; then
-    SANDBOX_ARGV+=(--ro-bind "$HOME/.kit.yml" "$HOME/.kit.yml")
+    add_ro_bind "$HOME/.kit.yml"
   fi
 
-  # kit's session store is writable so a sandboxed session can persist.
-  SANDBOX_ARGV+=(--bind "$HOME/.kit" "$HOME/.kit")
+  # User-level agent skills are readable but never writable from a sandboxed
+  # session, so an agent cannot rewrite the instructions it runs under.
+  if [ -e "$HOME/.agents" ]; then
+    add_ro_bind "$HOME/.agents"
+  fi
 
-  SANDBOX_ARGV+=(--chdir "$WT_PATH" --setenv HOME "$HOME" --setenv GIT_OPTIONAL_LOCKS 0)
+  # The developer's editor setup, read-only, so a sandboxed session can edit
+  # with vim or nvim as configured but cannot rewrite that configuration.
+  bind_editor_config
+
+  # No session store is mounted. The kit launch passes --no-session (see
+  # cmd_run), so kit keeps the conversation in memory and never opens a session
+  # directory; leaving the host store out of the sandbox also keeps every other
+  # session's transcript out of reach.
+
+  # A kwt launch is unattended by definition, so ask kit's headless extension
+  # (extensions/00-headless.go) to start active: the worker cannot then block on
+  # a question or a privilege password. The session can be made interactive
+  # again from inside with /headless.
+  if [ "$HEADLESS" = 1 ]; then
+    SANDBOX_ARGV+=(--setenv KIT_OPT_HEADLESS true)
+  fi
+
+  SANDBOX_ARGV+=(--chdir "$TARGET_DIR" --setenv HOME "$HOME" --setenv GIT_OPTIONAL_LOCKS 0)
   SANDBOX_ARGV+=(--)
   SANDBOX_ARGV+=("$@")
 }
@@ -288,67 +262,43 @@ quote_join() {
 # Plan
 # ---------------------------------------------------------------------------
 emit_plan() {
-  local i
-  printf 'worktree %s\n' "$WT_PATH"
-  printf 'branch %s\n' "$BRANCH"
-  if [ -n "$BASE" ]; then printf 'base %s\n' "$BASE"; fi
-  for i in "${!LINK_NAMES[@]}"; do
-    printf 'link %s %s\n' "${LINK_NAMES[$i]}" "${LINK_TARGETS[$i]}"
-  done
-  printf 'session %s\n' "$PROJECT"
-  printf 'window %s\n' "$WINDOW"
+  printf 'dir %s\n' "$TARGET_DIR"
   if [ "${#SANDBOX_ARGV[@]}" -gt 0 ]; then
     printf 'sandbox %s\n' "$(quote_join "${SANDBOX_ARGV[@]}")"
   fi
-  if [ "$DETACHED" = 1 ]; then printf 'attach %s\n' "$PROJECT"; fi
 }
 
 # ---------------------------------------------------------------------------
-# `kwt <branch>`
+# `kwt <dir>`
 # ---------------------------------------------------------------------------
-cmd_branch() {
-  local branch="" base="" detached=0 allow_git_write=0 dry_run=0
+cmd_run() {
+  local dir="" allow_git_write=0 dry_run=0
   local -a prompt=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --) shift; prompt=("$@"); break ;;
-      -b|--base)
-        [ $# -ge 2 ] || die "$1 requires a value"
-        base=$2; shift 2 ;;
-      --base=*) base=${1#*=}; shift ;;
-      -d|--detached) detached=1; shift ;;
       --allow-git-write) allow_git_write=1; shift ;;
       --dry-run) dry_run=1; shift ;;
       -h|--help) usage; exit 0 ;;
       -*) die "unknown option: $1" ;;
       *)
-        if [ -n "$branch" ]; then die "unexpected argument: $1"; fi
-        branch=$1; shift ;;
+        if [ -n "$dir" ]; then die "unexpected argument: $1"; fi
+        dir=$1; shift ;;
     esac
   done
-  [ -n "$branch" ] || die "missing <branch>"
+  [ -z "$dir" ] && dir="."
 
-  resolve_project
-  BRANCH=$branch
-  SLUG=$(slug_of "$BRANCH")
-  WT_PATH=$(worktree_path "$SLUG")
-  DETACHED=$detached
-  DRY_RUN=$dry_run
+  resolve_dir "$dir"
   ALLOW_GIT_WRITE=$allow_git_write
+  DRY_RUN=$dry_run
+  HEADLESS=1
   PROMPT=()
   if [ "${#prompt[@]}" -gt 0 ]; then PROMPT=("${prompt[@]}"); fi
-  WINDOW=$SLUG
+  resolve_git_dirs
 
-  if [ -z "$base" ]; then
-    BASE=$(git -C "$MAIN" rev-parse --verify HEAD 2>/dev/null) || die "cannot resolve the current HEAD"
-  else
-    BASE=$(git -C "$MAIN" rev-parse --verify "${base}^{commit}" 2>/dev/null) \
-      || die "cannot resolve base '$base'"
-  fi
-
-  compute_links
-  compute_shared_targets
-  local -a kit_argv=(--no-daemon)
+  # --no-session keeps the conversation in memory. kwt mounts no session store,
+  # so a durable session would have nowhere to live (see build_sandbox).
+  local -a kit_argv=(--no-daemon --no-session)
   if [ "${#PROMPT[@]}" -gt 0 ]; then kit_argv+=("${PROMPT[@]}"); fi
   build_sandbox "$(kit_binary)" "${kit_argv[@]}"
 
@@ -357,169 +307,41 @@ cmd_branch() {
     return 0
   fi
 
-  ensure_worktree
-  create_links
-  mkdir -p "$HOME/.kit"
-  spawn_window "$PROJECT" "$WINDOW" "" "$(quote_join "${SANDBOX_ARGV[@]}")"
+  exec "${SANDBOX_ARGV[@]}"
 }
 
 # ---------------------------------------------------------------------------
-# `kwt shell <branch>`
+# `kwt shell <dir>`
 # ---------------------------------------------------------------------------
 cmd_shell() {
-  local branch="" create=0 sandboxed=0 dry_run=0
+  local dir="" allow_git_write=0 dry_run=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --) shift; break ;;
-      --create) create=1; shift ;;
-      --sandboxed) sandboxed=1; shift ;;
+      --allow-git-write) allow_git_write=1; shift ;;
       --dry-run) dry_run=1; shift ;;
       -h|--help) usage; exit 0 ;;
       -*) die "unknown option: $1" ;;
       *)
-        if [ -n "$branch" ]; then die "unexpected argument: $1"; fi
-        branch=$1; shift ;;
+        if [ -n "$dir" ]; then die "unexpected argument: $1"; fi
+        dir=$1; shift ;;
     esac
   done
-  [ -n "$branch" ] || die "missing <branch>"
+  [ -z "$dir" ] && dir="."
 
-  resolve_project
-  BRANCH=$branch
-  SLUG=$(slug_of "$BRANCH")
-  WT_PATH=$(worktree_path "$SLUG")
+  resolve_dir "$dir"
+  ALLOW_GIT_WRITE=$allow_git_write
   DRY_RUN=$dry_run
-  ALLOW_GIT_WRITE=0
-  WINDOW="$SLUG~"
-
-  local exists=0
-  if worktree_exists; then exists=1; fi
-  if [ "$exists" = 0 ] && [ "$create" = 0 ]; then
-    die "no Worktree for '$branch' at $WT_PATH; run: kwt $branch"
-  fi
-  if [ "$exists" = 0 ]; then
-    BASE=$(git -C "$MAIN" rev-parse --verify HEAD 2>/dev/null) || die "cannot resolve the current HEAD"
-  fi
-
-  compute_links
-  if [ "$sandboxed" = 1 ]; then
-    compute_shared_targets
-    build_sandbox "${SHELL:-/bin/bash}"
-  fi
+  HEADLESS=0
+  resolve_git_dirs
+  build_sandbox "${SHELL:-/bin/bash}"
 
   if [ "$DRY_RUN" = 1 ]; then
     emit_plan
     return 0
   fi
 
-  if [ "$exists" = 0 ]; then
-    ensure_worktree
-    create_links
-  fi
-
-  local cwd="$WT_PATH" cmd=""
-  if [ "$sandboxed" = 1 ]; then
-    mkdir -p "$HOME/.kit"
-    cmd=$(quote_join "${SANDBOX_ARGV[@]}")
-  fi
-  spawn_window "$PROJECT" "$WINDOW" "$cwd" "$cmd"
-}
-
-# ---------------------------------------------------------------------------
-# Worktree listing
-# ---------------------------------------------------------------------------
-# Emit `<path>\t<branch>` for every Worktree of the Project: the entries under
-# the Main checkout's .worktrees directory.
-list_worktrees() {
-  local line path="" branch=""
-  local root="$MAIN/.worktrees"
-  while IFS= read -r line || [ -n "$line" ]; do
-    if [ -z "$line" ]; then
-      case "$path" in "$root"/*) printf '%s\t%s\n' "$path" "$branch" ;; esac
-      path=""; branch=""; continue
-    fi
-    case "$line" in
-      "worktree "*) path=${line#worktree } ;;
-      "branch refs/heads/"*) branch=${line#branch refs/heads/} ;;
-    esac
-  done < <(git -C "$MAIN" worktree list --porcelain)
-  case "$path" in "$root"/*) printf '%s\t%s\n' "$path" "$branch" ;; esac
-}
-
-# ---------------------------------------------------------------------------
-# `kwt ls`
-# ---------------------------------------------------------------------------
-cmd_ls() {
-  resolve_project
-  local path branch slug status
-  while IFS=$'\t' read -r path branch; do
-    if [ "$path" = "$MAIN" ]; then continue; fi
-    if [ -n "$branch" ]; then
-      slug=$(slug_of "$branch")
-    else
-      slug=$(basename "$path")
-    fi
-    if tmux_has_window "$PROJECT" "$slug"; then
-      status=running
-    else
-      status=stopped
-    fi
-    printf '%s %s %s\n' "$status" "$slug" "$path"
-  done < <(list_worktrees)
-}
-
-# ---------------------------------------------------------------------------
-# `kwt rm [<branch>]`
-# ---------------------------------------------------------------------------
-cmd_rm() {
-  local branch="" force=0
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --force) force=1; shift ;;
-      -h|--help) usage; exit 0 ;;
-      -*) die "unknown option: $1" ;;
-      *)
-        if [ -n "$branch" ]; then die "unexpected argument: $1"; fi
-        branch=$1; shift ;;
-    esac
-  done
-
-  resolve_project
-  local path b slug
-  if [ -z "$branch" ]; then
-    local -a slugs=()
-    while IFS=$'\t' read -r path b; do
-      if [ "$path" = "$MAIN" ]; then continue; fi
-      if [ -n "$b" ]; then slugs+=("$(slug_of "$b")"); else slugs+=("$(basename "$path")"); fi
-    done < <(list_worktrees)
-    [ "${#slugs[@]}" -gt 0 ] || die "no Worktrees to remove"
-    printf 'Select a Worktree to remove:\n' >&2
-    select slug in "${slugs[@]}"; do
-      if [ -n "$slug" ]; then
-        branch=$slug
-        break
-      fi
-    done
-    [ -n "$branch" ] || die "no Worktree selected"
-  fi
-
-  SLUG=$(slug_of "$branch")
-  WT_PATH=$(worktree_path "$SLUG")
-
-  local found=0
-  while IFS=$'\t' read -r path b; do
-    if [ "$path" = "$WT_PATH" ]; then found=1; break; fi
-  done < <(list_worktrees)
-  if [ "$found" = 0 ]; then
-    die "no Worktree for '$branch' at $WT_PATH"
-  fi
-
-  if tmux_has_window "$PROJECT" "$SLUG" && [ "$force" = 0 ]; then
-    die "a kit session is running for '$branch'; pass --force to remove it"
-  fi
-
-  tmux kill-window -t "$PROJECT:$SLUG" >/dev/null 2>&1 || true
-  tmux kill-window -t "$PROJECT:$SLUG~" >/dev/null 2>&1 || true
-  git -C "$MAIN" worktree remove --force "$WT_PATH"
+  exec "${SANDBOX_ARGV[@]}"
 }
 
 # ---------------------------------------------------------------------------
@@ -527,16 +349,13 @@ cmd_rm() {
 # ---------------------------------------------------------------------------
 main() {
   if [ $# -eq 0 ]; then
-    usage >&2
-    exit 2
+    cmd_run "."
+    exit $?
   fi
   case "$1" in
     shell) shift; cmd_shell "$@" ;;
-    ls) shift; cmd_ls "$@" ;;
-    rm) shift; cmd_rm "$@" ;;
     -h|--help|help) usage; exit 0 ;;
-    -*) die "unknown option: $1" ;;
-    *) cmd_branch "$@" ;;
+    *) cmd_run "$@" ;;
   esac
 }
 
