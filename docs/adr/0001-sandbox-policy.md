@@ -2,8 +2,9 @@
 
 ## Status
 
-Accepted. Amended by ADR-0002: kit's session store is no longer mounted, and
-sandboxed kit sessions are ephemeral.
+Accepted. Amended by ADR-0002 (kit's session store is no longer mounted, and
+sandboxed kit sessions are ephemeral) and ADR-0005 (nvim's state directory is a
+private tmpfs, not the host's).
 
 ## Context
 

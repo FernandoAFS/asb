@@ -1,29 +1,36 @@
-# kwt
+# asb
 
-`kwt` runs kit inside a sandbox: a single command that launches a process in a
-default-deny `bwrap` sandbox with one writable directory, read-only git state,
-and the host's tools and kit configuration mounted read-only. This file fixes
+`asb` runs an AI coding agent inside a sandbox: a single command that launches a
+process in a default-deny `bwrap` sandbox with one writable directory, read-only
+git state, and the host's tools and the agent's configuration mounted read-only
+or, where the agent writes lock files to read its configuration, as an ephemeral
+copy-on-write overlay. The agent profile is explicit — `asb kit` and `asb pig` —
+and `asb --shell` runs a shell in the same sandbox for debugging. This file fixes
 the words the project uses for those things.
 
 ## Language
 
 **Target directory**:
-The one directory a Sandboxed process may write to. `kwt` resolves it from the
+The one directory a Sandboxed process may write to. `asb` resolves it from the
 optional `<dir>` argument, defaulting to the current directory when omitted,
 makes it the sandbox's working directory, and mounts it writable.
 _Avoid_: worktree, root, cwd
 
 **Sandbox**:
 The `bwrap` invocation that runs a process with a default-deny filesystem. Only
-the Target directory and `/tmp` are writable.
+the Target directory and `/tmp` are persistently writable. An agent's
+configuration may be a copy-on-write overlay: readable from the host, writable
+in an invisible tmpfs, with every write discarded when the sandbox exits. The
+editor's state directory is not the host's either: `XDG_STATE_HOME` points at a
+private tmpfs, so undo history and shada stay out of reach.
 _Avoid_: jail, container, chroot
 
-**kit session**:
-A running kit instance inside the Sandbox. A kit session is ephemeral: `kwt`
-launches it with `--no-session`, so it keeps its conversation in memory and
-writes no session record. `kwt shell` runs a shell under the same policy but is
-not a kit session.
-_Avoid_: agent, daemon
+**agent session**:
+A running agent inside the Sandbox. An agent session is ephemeral: the launcher
+mounts no session store and starts the agent without a durable session, so it
+keeps its conversation in memory and writes no session record. `asb --shell`
+runs a shell under the same policy but is not an agent session.
+_Avoid_: agent, bot, daemon
 
 **Project**:
 The git repository that contains the Target directory, when there is one. Its

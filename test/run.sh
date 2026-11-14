@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run every kwt test file.
+# Run every asb test file.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 status=0

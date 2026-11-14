@@ -7,7 +7,7 @@ t_context_glossary() {
   local c
   c=$(cat "$ROOT/CONTEXT.md")
   local term
-  for term in "Target directory" Sandbox "kit session" Project; do
+  for term in "Target directory" Sandbox "agent session" Project; do
     assert_contains "$c" "$term"
   done
 }
