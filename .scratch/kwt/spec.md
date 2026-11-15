@@ -58,9 +58,10 @@ The sandbox policy below is shared; a profile supplies only the agent payload.
   (`$PIG_HOME`, else `$XDG_CONFIG_HOME/pig`, else `~/.pig`) and the agent
   directory (`$PIG_CODING_AGENT_DIR`, or `~/.pi/agent` when `PIG_USE_PI_DIRS=1`),
   both mounted as copy-on-write overlays because Pig creates lock files
-  (`trust.json.lock`) to read its configuration; the session store replaced
-  with an empty read-only directory; launch `--no-session`; no headless switch
-  exists.
+  (`trust.json.lock`) to read its configuration; the host session stores
+  replaced with empty read-only directories; launch
+  `--session-dir <Target>/.asb/pig/sessions`, a durable store the Target owns,
+  so a run can be continued or resumed; no headless switch exists.
 
 An unknown agent fails with a message naming the supported agents. A missing
 agent fails with a message that one is required.
@@ -128,9 +129,11 @@ A single `bwrap` invocation per launched process, default-deny:
 - `--allow-git-write` makes the git state writable instead of read-only.
 - The sandboxed kit launch always passes `--no-daemon`, so kit never hands the
   session to the host daemon (which would run kit outside the sandbox).
-- Every sandboxed agent launch passes the agent's ephemeral flag
-  (`--no-session`), so the session stays in memory: no session store is mounted
-  and no session record reaches disk.
+- Kit's sandboxed launch passes `--no-session`, so its session stays in
+  memory: no session store is mounted and no session record reaches disk.
+- Pig's sandboxed launch passes `--session-dir <Target>/.asb/pig/sessions`, so
+  its transcript persists in a store the Target owns. The host's session stores
+  are still hidden, so no other project's session is reachable.
 - The kit launch sets `KIT_OPT_HEADLESS=true`, so kit's headless extension
   starts active and the worker cannot block on an interactive question or a
   privilege prompt. `--shell` does not set it, and the pig profile has no
@@ -184,9 +187,12 @@ A single `bwrap` invocation per launched process, default-deny:
 - Git state is read-only unless `--allow-git-write`.
 - The agent is always explicit; there is no agent-less sandbox.
 - Sandboxed kit launches are always `--no-daemon`.
-- Sandboxed agent launches are always `--no-session`; no session store is
-  mounted or readable. For pig, whose store lives inside the mounted
-  configuration, the store is replaced with an empty read-only directory.
+- Sandboxed kit launches are always `--no-session`; no session store is
+  mounted or readable.
+- Sandboxed pig launches use a durable store inside the Target
+  (`<Target>/.asb/pig/sessions`) and never the host's store. Every host session
+  store is replaced with an empty read-only directory, so no other project's
+  session is reachable.
 - `--shell` is a debugging mode of a named agent profile, not a separate policy.
 
 ## Out of Scope
@@ -202,8 +208,9 @@ A single `bwrap` invocation per launched process, default-deny:
   installs happen outside the sandbox).
 - Setting an agent session display name.
 - Live sessions after exiting a sandboxed agent instance.
-- Session persistence for sandboxed launches; they are ephemeral by design
-  (`--no-session`), so there is nothing to resume.
+- Session persistence for sandboxed kit launches; they remain ephemeral by
+  design (`--no-session`), so there is nothing to resume. Pig launches persist
+  in a store the Target owns.
 - Remote/paired agent hosts.
 
 ## Testing Decisions
