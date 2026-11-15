@@ -26,10 +26,11 @@ private tmpfs, so undo history and shada stay out of reach.
 _Avoid_: jail, container, chroot
 
 **agent session**:
-A running agent inside the Sandbox. An agent session is ephemeral: the launcher
-mounts no session store and starts the agent without a durable session, so it
-keeps its conversation in memory and writes no session record. `asb --shell`
-runs a shell under the same policy but is not an agent session.
+A running agent inside the Sandbox. Its durability is the agent profile's: a kit
+session is ephemeral and keeps its conversation in memory, while a pig session
+writes its transcript to a store the Target owns, so it can be continued or
+resumed. `asb --shell` runs a shell under the same policy but is not an agent
+session.
 _Avoid_: agent, bot, daemon
 
 **Project**:

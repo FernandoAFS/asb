@@ -18,11 +18,12 @@ t_pig_config_is_a_copy_on_write_overlay() {
   assert_not_contains "$out" "--ro-bind $HOME/.pig $HOME/.pig"
 }
 
-t_pig_launches_ephemeral_without_kit_flags() {
+t_pig_launches_with_a_target_owned_session_dir() {
   mk_env
   mk_pig_config
   out=$(run_pig . --dry-run)
-  assert_contains "$out" "pig --no-session"
+  assert_contains "$out" "pig --session-dir $SB/proj/.asb/pig/sessions"
+  assert_not_contains "$out" "--no-session"
   assert_not_contains "$out" "--no-daemon"
   assert_not_contains "$out" "KIT_OPT_HEADLESS"
 }
@@ -87,7 +88,25 @@ t_pig_prompt_passthrough() {
   mk_env
   mk_pig_config
   out=$(run_pig . --dry-run -- "hello world")
-  assert_contains "$out" "pig --no-session hello\\ world"
+  assert_contains "$out" "pig --session-dir $SB/proj/.asb/pig/sessions hello\\ world"
+}
+
+t_pig_continue_is_passed_through() {
+  mk_env
+  mk_pig_config
+  out=$(run_pig . --dry-run -- --continue)
+  assert_contains "$out" "pig --session-dir $SB/proj/.asb/pig/sessions --continue"
+}
+
+# A store the Target owns is the launch's own; an environment variable that
+# happens to name it must not be hidden with a tmpfs.
+t_target_session_dir_is_not_hidden() {
+  mk_env
+  mk_pig_config
+  export PIG_CODING_AGENT_SESSION_DIR="$SB/proj/.asb/pig/sessions"
+  out=$(run_pig . --dry-run)
+  assert_contains "$out" "pig --session-dir $SB/proj/.asb/pig/sessions"
+  assert_not_contains "$out" "--tmpfs $SB/proj/.asb/pig/sessions"
 }
 
 t_pig_shell_is_not_a_pig_session() {
@@ -95,7 +114,7 @@ t_pig_shell_is_not_a_pig_session() {
   mk_pig_config
   out=$(run_pig --shell . --dry-run)
   assert_contains "$out" "/bin/bash"
-  assert_not_contains "$out" "pig --no-session"
+  assert_not_contains "$out" "pig --session-dir"
 }
 
 t_pig_dry_run_performs_no_side_effects() {
@@ -112,18 +131,20 @@ t_agent_runs_pig_in_the_current_directory() {
   : >"$SHIM_LOG"
   run_pig >/dev/null
   assert_log_contains "bwrap"
-  assert_log_contains "pig --no-session"
+  assert_log_contains "pig --session-dir $SB/proj/.asb/pig/sessions"
 }
 
 run_test "pig configuration is a copy-on-write overlay" t_pig_config_is_a_copy_on_write_overlay
-run_test "pig launches ephemeral without kit's flags" t_pig_launches_ephemeral_without_kit_flags
-run_test "the pig session store is hidden and read-only" t_pig_sessions_are_hidden_read_only
+run_test "pig launches with a Target-owned session dir" t_pig_launches_with_a_target_owned_session_dir
+run_test "the host pig session store is hidden and read-only" t_pig_sessions_are_hidden_read_only
 run_test "the pig config root follows XDG_CONFIG_HOME" t_pig_config_follows_xdg_config_home
 run_test "PIG_HOME overrides XDG_CONFIG_HOME" t_pig_home_overrides_xdg
 run_test "the pig agent directory can move independently" t_pig_agent_dir_moves_independently
 run_test "shared Pi directories are mounted and hidden" t_pig_shared_pi_dirs
 run_test "an explicit pig session directory is hidden" t_pig_explicit_session_dir_is_hidden
+run_test "a Target-owned session dir is not hidden" t_target_session_dir_is_not_hidden
 run_test "a trailing prompt is passed through to pig" t_pig_prompt_passthrough
+run_test "--continue is passed through to pig" t_pig_continue_is_passed_through
 run_test "asb pig shell is not a pig session" t_pig_shell_is_not_a_pig_session
 run_test "a pig dry run performs no side effects" t_pig_dry_run_performs_no_side_effects
 run_test "asb pig runs in the current directory" t_agent_runs_pig_in_the_current_directory

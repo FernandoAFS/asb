@@ -6,9 +6,11 @@
 # directory is the only writable source tree; the Project's git state, the
 # host's tools, the agent's configuration, and the user's agent skills are
 # mounted read-only — except an agent's configuration, which may be a
-# copy-on-write overlay when the agent writes lock files to read it. The agent profile is explicit: `asb kit` and `asb pig`.
-# `--shell` runs a shell in the same sandbox for debugging. See
-# .scratch/kwt/spec.md for the specification.
+# copy-on-write overlay when the agent writes lock files to read it. A pig
+# session writes its transcript to a store the Target owns
+# (<dir>/.asb/pig/sessions), so a run can be continued or resumed. The agent
+# profile is explicit: `asb kit` and `asb pig`. `--shell` runs a shell in the
+# same sandbox for debugging. See .scratch/kwt/spec.md for the specification.
 #
 set -euo pipefail
 
@@ -51,6 +53,9 @@ options:
 
 <dir> defaults to the current directory. Arguments after -- are passed to the
 agent, or to the shell when --shell is given.
+
+A pig session persists under <dir>/.asb/pig/sessions; pass --continue, --resume,
+or --session through -- to reopen one.
 EOF
 }
 
@@ -169,13 +174,25 @@ pig_agent_dir() {
   fi
 }
 
+# Pig's session store for a sandboxed launch: a directory the Target owns,
+# under `.asb/`, rather than the host's store. A run can therefore persist and
+# --continue its transcript, yet neither write to nor read any other project's
+# sessions. The Target is already bound writable, so this needs no mount of its
+# own. `--session-dir` overrides the environment and the sessionDir setting, so
+# the host store stays out of reach even when the developer set one.
+pig_session_dir() {
+  printf '%s' "$TARGET_DIR/.asb/pig/sessions"
+}
+
 # Replace a session store with an empty read-only directory. The store lives
 # inside the configuration, so this overlays it: a sandboxed session cannot
 # read another session's transcript, and nothing outside the Target becomes
-# writable.
+# writable. A store the Target owns is left alone: it is the launch's own
+# store (pig_session_dir), bound writable with the Target.
 hide_session_store() {
   local dir=$1
   [ -e "$dir" ] || return 0
+  case "$dir" in "$TARGET_DIR"|"$TARGET_DIR"/*) return 0 ;; esac
   SANDBOX_ARGV+=(--tmpfs "$dir" --remount-ro "$dir")
 }
 
@@ -210,9 +227,11 @@ bind_pig_config() {
       ;;
   esac
 
-  # Replace every reachable session store with an empty read-only directory:
-  # the default under the agent directory, and any store an environment
-  # variable names.
+  # Replace every reachable host session store with an empty read-only
+  # directory: the default under the agent directory, and any store an
+  # environment variable names. The launch's own store is under the Target
+  # (pig_session_dir) and is deliberately left reachable and writable; the
+  # explicit --session-dir keeps pig from consulting any store hidden here.
   local -a seen=()
   for s in \
     "$agent_dir/sessions" \
@@ -246,15 +265,18 @@ agent_headless_env() {
   esac
 }
 
-# Arguments the launched agent runs with. Both agents are launched without a
-# durable session; kit is additionally launched without its daemon, which would
-# otherwise hand the session to a host process outside the sandbox. Arguments
-# from the command line follow the launcher's own flags.
+# Arguments the launched agent runs with. Kit is launched without a durable
+# session and without its daemon, which would otherwise hand the session to a
+# host process outside the sandbox. Pig is launched with a durable session in a
+# store the Target owns (pig_session_dir), so an interrupted run leaves a
+# transcript and a later run can pass --continue or --resume through the
+# launcher's `--` boundary. Arguments from the command line follow the
+# launcher's own flags.
 LAUNCH_ARGV=()
 agent_launch_argv() {
   case "$PROFILE" in
     kit) LAUNCH_ARGV=(--no-daemon --no-session) ;;
-    pig) LAUNCH_ARGV=(--no-session) ;;
+    pig) LAUNCH_ARGV=(--session-dir "$(pig_session_dir)") ;;
   esac
   if [ "${#AGENT_ARGS[@]}" -gt 0 ]; then
     LAUNCH_ARGV+=("${AGENT_ARGS[@]}")

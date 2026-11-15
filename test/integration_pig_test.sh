@@ -28,6 +28,13 @@ install_probe_pig() {
   if echo x >"$PROBE_CONFIG/settings.json" 2>/dev/null; then echo "config=writable"; else echo "config=readonly"; fi
   if [ -r "$PROBE_SESSIONS/secret.jsonl" ]; then echo "sessions=readable"; else echo "sessions=hidden"; fi
   if echo x >"$PROBE_SESSIONS/denied" 2>/dev/null; then echo "sessions=writable"; else echo "sessions=readonly"; fi
+  # The launch's own store is under the Target and must be writable so a
+  # transcript persists for a later --continue.
+  if mkdir -p "$PROBE_TARGET_SESSIONS" && echo x >"$PROBE_TARGET_SESSIONS/probe.jsonl" 2>/dev/null; then
+    echo "target_sessions=writable"
+  else
+    echo "target_sessions=readonly"
+  fi
 } >sandbox-probe.out 2>&1
 exit 0
 PROBE
@@ -35,7 +42,7 @@ PROBE
   export PATH="$SB/bin:$PATH"
 }
 
-t_real_pig_sandbox_allows_ephemeral_config_writes() {
+t_real_pig_sandbox_keeps_target_sessions() {
   mk_env
   # mk_env clears XDG_CONFIG_HOME, so pig's root defaults to ~/.pig.
   mkdir -p "$HOME/.pig/agent/sessions"
@@ -45,6 +52,7 @@ t_real_pig_sandbox_allows_ephemeral_config_writes() {
   export PROBE_GITDIR="$SB/proj/.git"
   export PROBE_CONFIG="$HOME/.pig/agent"
   export PROBE_SESSIONS="$HOME/.pig/agent/sessions"
+  export PROBE_TARGET_SESSIONS="$SB/proj/.asb/pig/sessions"
 
   run_pig . >/dev/null 2>&1
 
@@ -61,14 +69,17 @@ t_real_pig_sandbox_allows_ephemeral_config_writes() {
   assert_contains "$out" "config=writable"
   assert_contains "$out" "sessions=hidden"
   assert_contains "$out" "sessions=readonly"
-  assert_contains "$out" "args=--no-session"
+  assert_contains "$out" "args=--session-dir $PROBE_TARGET_SESSIONS"
+  assert_contains "$out" "target_sessions=writable"
 
-  # Everything the probe wrote stayed inside the sandbox.
+  # Everything the probe wrote to the host configuration stayed in the sandbox;
+  # only the Target-owned session store persists.
   assert_eq "$(cat "$HOME/.pig/agent/settings.json")" '{"theme":"system"}'
   assert_no_file "$HOME/.pig/agent/trust.json.lock"
+  assert_file "$SB/proj/.asb/pig/sessions/probe.jsonl"
 }
 
-run_test "the real pig sandbox allows ephemeral config writes and hides sessions" \
-  t_real_pig_sandbox_allows_ephemeral_config_writes
+run_test "the real pig sandbox hides host sessions and keeps Target-owned ones" \
+  t_real_pig_sandbox_keeps_target_sessions
 
 finish
