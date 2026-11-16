@@ -1,1 +1,12 @@
-.worktree
+# Local worktrees and worktree tooling
+.worktree/
+.workmux.yaml
+
+# Private design notes, specs, and issue tracking
+.scratch/
+
+# Runtime session store created inside a Target directory
+.asb/
+
+# Local secrets and environment overrides
+.env
