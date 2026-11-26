@@ -101,7 +101,7 @@ and `bash`. That's it for the launcher — no Go required unless you also want t
 credential-injection proxy.
 
 ```sh
-git clone https://github.com/<you>/asb.git
+git clone https://github.com/FernandoAFS/asb.git
 cd asb
 make install          # asb + the headless kit extension + the proxy
 ```
