@@ -6,64 +6,30 @@
       <stop offset="1" stop-color="#080c12"/>
     </radialGradient>
     <linearGradient id="amber" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#ffd979"/>
+      <stop offset="0" stop-color="#ffe08a"/>
       <stop offset="0.5" stop-color="#fcb52b"/>
-      <stop offset="1" stop-color="#f08a00"/>
-    </linearGradient>
-    <linearGradient id="caliper" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#ff6a5e"/>
-      <stop offset="1" stop-color="#cf2b2b"/>
+      <stop offset="1" stop-color="#ef8700"/>
     </linearGradient>
     <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
-      <feGaussianBlur stdDeviation="7" result="b"/>
-      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
-    </filter>
-    <filter id="inset" x="-30%" y="-30%" width="160%" height="160%">
-      <feGaussianBlur stdDeviation="4" result="b"/>
+      <feGaussianBlur stdDeviation="6" result="b"/>
       <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
     </filter>
   </defs>
 
-  <!-- badge -->
+  <!-- app-style badge -->
   <rect x="0" y="0" width="512" height="512" rx="116" fill="url(#badge)"/>
   <rect x="1.5" y="1.5" width="509" height="509" rx="114.5" fill="none" stroke="#2b3849" stroke-width="3"/>
   <rect x="26" y="26" width="460" height="460" rx="92" fill="none" stroke="#161f2b" stroke-width="2"/>
 
-  <!-- brake rotor ring -->
-  <circle cx="256" cy="256" r="178" fill="none" stroke="url(#amber)" stroke-width="18" filter="url(#glow)" opacity="0.96"/>
-  <circle cx="256" cy="256" r="167" fill="none" stroke="#7a4a00" stroke-width="2" opacity="0.55"/>
-
-  <!-- drilled / vented holes around the rotor -->
-  <g fill="#080c12" stroke="#000000" stroke-width="2" filter="url(#inset)">
-    <circle cx="434"   cy="256"   r="9"/>
-    <circle cx="410.1" cy="345"   r="9"/>
-    <circle cx="345"   cy="410.1" r="9"/>
-    <circle cx="256"   cy="434"   r="9"/>
-    <circle cx="167"   cy="410.1" r="9"/>
-    <circle cx="101.9" cy="345"   r="9"/>
-    <circle cx="78"    cy="256"   r="9"/>
-    <circle cx="101.9" cy="167"   r="9"/>
-    <circle cx="167"   cy="101.9" r="9"/>
-    <circle cx="256"   cy="78"    r="9"/>
-    <circle cx="345"   cy="101.9" r="9"/>
-    <circle cx="410.1" cy="167"   r="9"/>
+  <!-- the warning-lamp mark: broken outer ring, inner ring, wordmark -->
+  <g filter="url(#glow)" fill="none" stroke="url(#amber)" stroke-linecap="round">
+    <path d="M 149.9 104.4 A 185 185 0 0 0 149.9 407.6" stroke-width="40"/>
+    <path d="M 362.1 104.4 A 185 185 0 0 1 362.1 407.6" stroke-width="40"/>
+    <circle cx="256" cy="256" r="145" stroke-width="22"/>
   </g>
 
-  <!-- brake caliper clamping the upper-right of the rotor -->
-  <g transform="rotate(-45 381.9 130.1)" filter="url(#glow)">
-    <rect x="336.9" y="107.1" width="90" height="46" rx="15" fill="url(#caliper)"/>
-    <rect x="345.9" y="116.1" width="72" height="9" rx="4.5" fill="#ffb3ad" opacity="0.55"/>
-    <circle cx="352" cy="130.1" r="6" fill="#5c1111"/>
-    <circle cx="411.8" cy="130.1" r="6" fill="#5c1111"/>
-  </g>
-
-  <!-- inner disc face -->
-  <circle cx="256" cy="256" r="132" fill="#0d131c" stroke="#26313f" stroke-width="3"/>
-  <circle cx="256" cy="256" r="132" fill="none" stroke="#000000" stroke-width="1" opacity="0.6"/>
-
-  <!-- ASB wordmark -->
-  <text x="256" y="299" text-anchor="middle"
+  <text x="254" y="294" text-anchor="middle"
         font-family="Liberation Sans, DejaVu Sans, Helvetica, Arial, sans-serif"
-        font-weight="800" font-size="112" letter-spacing="5"
+        font-weight="800" font-size="106" letter-spacing="2"
         fill="url(#amber)" filter="url(#glow)">ASB</text>
 </svg>
