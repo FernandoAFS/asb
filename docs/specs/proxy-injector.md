@@ -1,7 +1,6 @@
 # Spec: `asb-proxy` — host-side credential injection for asb
 
-Feature: `asb-proxy`
-Status: ready-for-agent
+Feature: `asb-proxy`  
 Date: 2026-11-15
 
 ## Problem Statement

@@ -10,7 +10,8 @@
 # session writes its transcript to a store the Target owns
 # (<dir>/.asb/pig/sessions), so a run can be continued or resumed. The agent
 # profile is explicit: `asb kit` and `asb pig`. `--shell` runs a shell in the
-# same sandbox for debugging. See .scratch/kwt/spec.md for the specification.
+# same sandbox for debugging. See CONTEXT.md for the glossary and docs/adr/
+# for the design decisions behind the policy.
 #
 set -euo pipefail
 

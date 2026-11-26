@@ -58,8 +58,6 @@ asb [<options>] <agent> [<dir>] [-- <args>...]
   the invocation-name indirection from the seam.
 - `--shell` no longer needs the agent binary on `PATH`, because shell mode does
   not bind the agent binary's directory. `PATH` still covers it when installed.
-- The issue-tracker feature directory keeps its historical `.scratch/kwt/` name;
-  renaming it would churn every issue path for no behavioural gain.
 
 ## Alternatives considered
 

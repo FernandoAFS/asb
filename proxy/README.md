@@ -11,7 +11,7 @@ ever holding the token.
 This is the credential-injection half of `asb`. Egress filtering is a separate,
 later concern; the network namespace is not unshared here.
 
-See `.scratch/proxy-injector/spec.md` for the full design.
+See [`docs/specs/proxy-injector.md`](../docs/specs/proxy-injector.md) for the full design.
 
 ## How it works
 

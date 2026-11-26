@@ -1,9 +1,8 @@
-<<<<<<< HEAD
 # Local worktrees and worktree tooling
 .worktree/
 .workmux.yaml
 
-# Private design notes, specs, and issue tracking
+# Private design notes and issue tracking
 .scratch/
 
 # Runtime session store created inside a Target directory
@@ -11,5 +10,6 @@
 
 # Local secrets and environment overrides
 .env
-.worktree
+
+# Build artifacts
 proxy/asb-proxy
