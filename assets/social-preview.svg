@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 630" width="1280" height="630" role="img" aria-label="asb — pull the brakes on your agents">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0.4" y2="1">
+      <stop offset="0" stop-color="#0c131d"/>
+      <stop offset="0.55" stop-color="#0a0f17"/>
+      <stop offset="1" stop-color="#05080d"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="0.5" cy="0.18" r="0.75">
+      <stop offset="0" stop-color="#f5a623" stop-opacity="0.22"/>
+      <stop offset="0.5" stop-color="#f5a623" stop-opacity="0.05"/>
+      <stop offset="1" stop-color="#f5a623" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="amber" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffe08a"/>
+      <stop offset="0.5" stop-color="#fcb52b"/>
+      <stop offset="1" stop-color="#ef8700"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="6" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+
+    <symbol id="mark" viewBox="0 0 512 512">
+      <g filter="url(#glow)" fill="none" stroke="url(#amber)" stroke-linecap="round">
+        <path d="M 149.9 104.4 A 185 185 0 0 0 149.9 407.6" stroke-width="40"/>
+        <path d="M 362.1 104.4 A 185 185 0 0 1 362.1 407.6" stroke-width="40"/>
+        <circle cx="256" cy="256" r="145" stroke-width="22"/>
+      </g>
+      <text x="254" y="294" text-anchor="middle"
+            font-family="Liberation Sans, DejaVu Sans, Helvetica, Arial, sans-serif"
+            font-weight="800" font-size="106" letter-spacing="2"
+            fill="url(#amber)" filter="url(#glow)">ASB</text>
+    </symbol>
+  </defs>
+
+  <rect width="1280" height="630" fill="url(#bg)"/>
+  <rect width="1280" height="630" fill="url(#halo)"/>
+
+  <use href="#mark" x="530" y="42" width="220" height="220"/>
+
+  <text x="640" y="372" text-anchor="middle"
+        font-family="Liberation Sans, DejaVu Sans, Helvetica, Arial, sans-serif"
+        font-weight="800" font-size="96" letter-spacing="1"
+        fill="#f7fafc">asb</text>
+
+  <text x="640" y="442" text-anchor="middle"
+        font-family="Liberation Sans, DejaVu Sans, Helvetica, Arial, sans-serif"
+        font-weight="700" font-size="41" letter-spacing="0.5"
+        fill="url(#amber)">Pull the brakes on your agents.</text>
+
+  <text x="640" y="494" text-anchor="middle"
+        font-family="Liberation Sans, DejaVu Sans, Helvetica, Arial, sans-serif"
+        font-weight="400" font-size="24"
+        fill="#9aa8bb">A lightweight, default-deny Linux sandbox for AI coding agents.</text>
+
+  <text x="640" y="556" text-anchor="middle"
+        font-family="Liberation Sans, DejaVu Sans, Helvetica, Arial, sans-serif"
+        font-weight="600" font-size="18" letter-spacing="7"
+        fill="#5f6f85">NO CONTAINER · NO VM · NO DAEMON</text>
+</svg>

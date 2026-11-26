@@ -9,6 +9,7 @@
 **A single shell script that runs an AI coding agent inside a default-deny Linux
 sandbox. No container. No VM. No daemon. No image to pull.**
 
+[![tests](https://github.com/FernandoAFS/asb/actions/workflows/test.yml/badge.svg)](https://github.com/FernandoAFS/asb/actions/workflows/test.yml)
 [![Platform](https://img.shields.io/badge/platform-linux-2b6cb0?style=flat-square)](#install)
 [![Dependencies](https://img.shields.io/badge/deps-bash%20%2B%20bwrap-4a5568?style=flat-square)](#install)
 [![Launcher](https://img.shields.io/badge/launcher-~590%20lines%20of%20bash-89e051?style=flat-square)](asb)
